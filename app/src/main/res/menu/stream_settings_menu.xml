@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/menu_profile_slow_network"
+        android:title="@string/menu_profile_slow_network"
+        android:showAsAction="never" />
+    <item
+        android:id="@+id/menu_profile_balanced"
+        android:title="@string/menu_profile_balanced"
+        android:showAsAction="never" />
+    <item
+        android:id="@+id/menu_profile_quality"
+        android:title="@string/menu_profile_quality"
+        android:showAsAction="never" />
+    <item
+        android:id="@+id/menu_safe_low_bandwidth_profile"
+        android:title="@string/menu_safe_low_bandwidth_profile"
+        android:showAsAction="never" />
+    <item
+        android:id="@+id/menu_local_smoothing_profile"
+        android:title="@string/menu_local_smoothing_profile"
+        android:showAsAction="never" />
+    <item
+        android:id="@+id/menu_disable_all_4g_optimizations"
+        android:title="@string/menu_disable_all_4g_optimizations"
+        android:showAsAction="never" />
+</menu>
