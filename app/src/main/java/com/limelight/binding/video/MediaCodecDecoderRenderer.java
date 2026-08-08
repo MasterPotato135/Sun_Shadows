@@ -200,8 +200,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // bitrate original. Isso evita o spike de rede imediato quando a cena muda subitamente.
     private int consecutiveSimilarFrames = 0;
     private int consecutiveDissimilarFrames = 0;
-    private int currentDynamicBitrate = 0; // 0 = não inicializado; usa prefs.bitrate como base
-    private boolean bitrateReduced = false;
+    private volatile int currentDynamicBitrate = 0; // 0 = não inicializado; usa prefs.bitrate como base
+    private volatile boolean bitrateReduced = false;
     private static final int BITRATE_REDUCE_THRESHOLD = 10;  // frames similares para reduzir
     private static final int BITRATE_RESTORE_THRESHOLD = 5;  // frames distintos por degrau de subida
     private static final int BITRATE_REDUCE_PERCENT = 30;    // redução inicial (30% do atual)
@@ -308,6 +308,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private FramePacingController framePacingController;
     private HandlerThread choreographerHandlerThread;
     private Handler choreographerHandler;
+
+    // Thread dedicada para despachar requestBitrateChange() fora da thread de callback JNI,
+    // evitando deadlock/reentrância no moonlight-common-c quando chamado de submitDecodeUnit.
+    private HandlerThread bitrateHandlerThread;
+    private Handler bitrateHandler;
 
     private int numSpsIn;
     private int numPpsIn;
@@ -491,17 +496,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     
     // Solicita ao host encoder (Sunshine/NVENC) que ajuste o bitrate via control stream.
     // Esta é a única rota que realmente reduz bytes transmitidos pela rede.
-    public void updateDynamicBitrate(int newBitrate) {
+    public void updateDynamicBitrate(final int newBitrate) {
         if (newBitrate <= 0) {
             LimeLog.warning("Dynamic bitrate update ignored: invalid value " + newBitrate);
             return;
         }
-        LimeLog.info("Dynamic bitrate update: requesting " + newBitrate + " kbps from host encoder");
-        try {
-            MoonBridge.requestBitrateChange(newBitrate);
-        } catch (Exception e) {
-            LimeLog.warning("Dynamic bitrate update failed: " + e.getMessage());
-        }
+        // NOTA: MoonBridge.requestBitrateChange() foi declarado como native mas não possui
+        // implementação no moonlight-core. Chamar esse método lança UnsatisfiedLinkError
+        // e derruba o processo. A funcionalidade de bitrate dinâmico está desativada até
+        // que a implementação nativa seja adicionada ao moonlight-core.
+        LimeLog.info("Dynamic bitrate update suppressed (no native impl): " + newBitrate + " kbps");
     }
 
     public MediaCodecDecoderRenderer(Activity activity, PreferenceConfiguration prefs,
@@ -870,7 +874,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         long nowMs = SystemClock.uptimeMillis();
-        if (nowMs - lastBitrateAnalysisMs < prefs.bitrateAnalysisIntervalMs) {
+        // Guard: intervalo inválido (0 ou negativo) causaria análise em todo frame,
+        // enfileirando posts no bitrateHandler 60x/s e levando a OOM.
+        long safeIntervalMs = prefs.bitrateAnalysisIntervalMs > 0
+                ? prefs.bitrateAnalysisIntervalMs : 50;
+        if (nowMs - lastBitrateAnalysisMs < safeIntervalMs) {
             return;
         }
         lastBitrateAnalysisMs = nowMs;
@@ -894,6 +902,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         if (prefs.bitrateOptimization) {
+            // Guard: bitrate alvo inválido — não há base para calcular reduções/rampups.
+            // Ocorre quando BITRATE_PREF_STRING e BITRATE_PREF_OLD_STRING ausentes nas prefs
+            // (primeiro boot ou prefs corrompidas), resultando em prefs.bitrate == 0.
+            // Sem este guard, currentDynamicBitrate fica preso em 0 para sempre e
+            // o bitrateHandler acumula posts infinitamente até OOM.
+            if (prefs.bitrate <= 0) {
+                LimeLog.warning("Bitrate optimization skipped: prefs.bitrate is " + prefs.bitrate);
+                return;
+            }
             // BUG-FIX-2: sempre parte do bitrate alvo original para a reducao,
             // nunca do currentDynamicBitrate corrente -- evita reducao composta
             // (ex: 10000 -> 7000 -> 4900 -> ...) que travava o encoder num bitrate minimo.
@@ -1437,6 +1454,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.initialHeight = height;
         this.videoFormat = format;
         this.refreshRate = redrawRate;
+
+        // Inicia thread dedicada para chamadas de requestBitrateChange(),
+        // garantindo que nunca ocorram dentro da thread de callback JNI (submitDecodeUnit).
+        bitrateHandlerThread = new HandlerThread("Video - Bitrate");
+        bitrateHandlerThread.start();
+        bitrateHandler = new Handler(bitrateHandlerThread.getLooper());
 
         initLocalFrameOptimizationState(width, height);
 
@@ -2112,6 +2135,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
+        // Encerra a thread de bitrate (se iniciada)
+        if (bitrateHandlerThread != null) {
+            bitrateHandlerThread.quitSafely();
+            try {
+                bitrateHandlerThread.join();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                Thread.currentThread().interrupt();
+            }
+            bitrateHandlerThread = null;
+            bitrateHandler = null;
+        }
+
         // Wait for the renderer thread to shut down
         try {
             rendererThread.join();
@@ -2305,15 +2341,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     decoder = "(unknown)";
                 }
 
-                float decodeTimeMs = (float)lastTwo.decoderTimeMs / lastTwo.totalFramesReceived;
+                // Guard contra divisão por zero nos primeiros frames (janela de stats ainda vazia)
+                float decodeTimeMs = lastTwo.totalFramesReceived > 0
+                        ? (float)lastTwo.decoderTimeMs / lastTwo.totalFramesReceived
+                        : 0f;
+                float netDropPct = lastTwo.totalFrames > 0
+                        ? (float)lastTwo.framesLost / lastTwo.totalFrames * 100
+                        : 0f;
                 long rttInfo = MoonBridge.getEstimatedRttInfo();
                 StringBuilder sb = new StringBuilder();
                 sb.append(context.getString(R.string.perf_overlay_streamdetails, initialWidth + "x" + initialHeight, fps.totalFps)).append('\n');
                 sb.append(context.getString(R.string.perf_overlay_decoder, decoder)).append('\n');
                 sb.append(context.getString(R.string.perf_overlay_incomingfps, fps.receivedFps)).append('\n');
                 sb.append(context.getString(R.string.perf_overlay_renderingfps, fps.renderedFps)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_netdrops,
-                        (float)lastTwo.framesLost / lastTwo.totalFrames * 100)).append('\n');
+                sb.append(context.getString(R.string.perf_overlay_netdrops, netDropPct)).append('\n');
                 sb.append(context.getString(R.string.perf_overlay_netlatency,
                         (int)(rttInfo >> 32), (int)rttInfo)).append('\n');
                 if (lastTwo.framesWithHostProcessingLatency > 0) {
