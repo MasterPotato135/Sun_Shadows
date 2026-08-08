@@ -158,6 +158,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private int jumpFrameCounter = 0;
     private int jumpFrameMode = StreamConfiguration.JUMPFRAME_MODE_OFF;
     private static final int FRAME_SAMPLE_SIZE = 128;
+    // Grade 2D para o Block Analysis: 16 colunas × 8 linhas = 128 "pixels" pseudo-frame.
+    // Escolhido para que PSEUDO_FRAME_COLS * PSEUDO_FRAME_ROWS == FRAME_SAMPLE_SIZE
+    // e a proporção 2:1 aproxime uma tela widescreen (16:9 → 2:1 em escala reduzida).
+    private static final int PSEUDO_FRAME_COLS = 16;
+    private static final int PSEUDO_FRAME_ROWS = 8;
     private byte[] lastFrameSample;
     private long lastBitrateAnalysisMs;
     // FIX-1: AtomicInteger para evitar race condition entre input thread e render/choreographer thread
@@ -191,15 +196,18 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int SHARPNESS_QP_MAX = 40; // QP máximo (suavização)
 
     // Bitrate dinâmico baseado em similaridade de frames.
-    // Após BITRATE_REDUCE_THRESHOLD frames similares consecutivos, solicita redução de bitrate.
-    // Após BITRATE_RESTORE_THRESHOLD frames não-similares consecutivos, restaura o bitrate original.
+    // Redução: após BITRATE_REDUCE_THRESHOLD frames similares, reduz 30% imediatamente.
+    // Restauração: NÃO é instantânea — sobe em degraus de BITRATE_RAMPUP_STEP_PERCENT
+    // a cada BITRATE_RESTORE_THRESHOLD frames distintos consecutivos, até atingir o
+    // bitrate original. Isso evita o spike de rede imediato quando a cena muda subitamente.
     private int consecutiveSimilarFrames = 0;
     private int consecutiveDissimilarFrames = 0;
     private int currentDynamicBitrate = 0; // 0 = não inicializado; usa prefs.bitrate como base
     private boolean bitrateReduced = false;
     private static final int BITRATE_REDUCE_THRESHOLD = 10;  // frames similares para reduzir
-    private static final int BITRATE_RESTORE_THRESHOLD = 5;  // frames distintos para restaurar
-    private static final int BITRATE_REDUCE_PERCENT = 30;    // redução de 30% quando cena estável
+    private static final int BITRATE_RESTORE_THRESHOLD = 5;  // frames distintos por degrau de subida
+    private static final int BITRATE_REDUCE_PERCENT = 30;    // redução inicial (30% do atual)
+    private static final int BITRATE_RAMPUP_STEP_PERCENT = 15; // cada degrau de subida sobe 15% do alvo
 
     // Used on versions < 5.0
     private ByteBuffer[] legacyInputBuffers;
@@ -766,38 +774,99 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return sample;
     }
 
-    // Tolerância de ±4 para bytes de payload comprimido: variações pequenas de
-    // quantização entre frames visualmente idênticos não devem ser penalizadas.
-    // Bytes de cabeçalho NAL (primeiros 8) são comparados com igualdade exata
-    // pois diferenças neles indicam mudança de tipo/slice, não de conteúdo visual.
-    private static final int SIMILARITY_BYTE_TOLERANCE = 4;
+    // Número de blocos para análise estrutural da similaridade.
+    // A amostra é dividida em SIMILARITY_BLOCKS segmentos; cada um contribui com
+    // três métricas independentes (média, variância, gradiente), tornando a detecção
+    // mais robusta a variações de quantização entre frames visualmente idênticos.
+    private static final int SIMILARITY_BLOCKS = 8;
     private static final int SIMILARITY_HEADER_BYTES = 8;
 
+    /**
+     * Similaridade estrutural entre duas amostras de bitstream comprimido.
+     *
+     * Divide o payload em SIMILARITY_BLOCKS blocos e extrai três métricas por bloco:
+     *   1. Média     — captura mudanças globais de energia no bloco (peso 50%).
+     *   2. Variância — captura mudanças de complexidade/textura (peso 25%).
+     *   3. Gradiente — captura mudanças de borda e movimento entre bytes adjacentes (peso 25%).
+     *
+     * O cabeçalho NAL (primeiros SIMILARITY_HEADER_BYTES) contribui com 20% do score
+     * final via comparação exata — diferenças ali indicam mudança de tipo de frame,
+     * não de conteúdo visual.
+     *
+     * Resultado: 0 (completamente diferente) a 100 (idêntico).
+     */
     private int getEncodedFrameSimilarity(byte[] a, byte[] b) {
-        if (a == null || b == null || a.length != b.length) {
+        if (a == null || b == null || a.length != b.length || a.length == 0) {
             return 0;
         }
 
-        int score = 0;
-        int maxScore = a.length * 2; // cada byte vale até 2 pontos
+        // Cabeçalho NAL: comparação exata
+        int headerEnd = Math.min(SIMILARITY_HEADER_BYTES, a.length);
+        int headerHits = 0;
+        for (int i = 0; i < headerEnd; i++) {
+            if (a[i] == b[i]) headerHits++;
+        }
+        int hdrScore100 = (headerEnd > 0) ? (headerHits * 100 / headerEnd) : 100;
 
-        for (int i = 0; i < a.length; i++) {
-            int diff = Math.abs((a[i] & 0xFF) - (b[i] & 0xFF));
-            if (i < SIMILARITY_HEADER_BYTES) {
-                // Cabeçalho NAL: exige igualdade exata; divergência pesa mais
-                if (diff == 0) score += 2;
-            } else {
-                // Payload: tolerância de ±TOLERANCE conta como similar
-                if (diff == 0) {
-                    score += 2;
-                } else if (diff <= SIMILARITY_BYTE_TOLERANCE) {
-                    score += 1;
-                }
-                // diff > TOLERANCE: 0 pontos
-            }
+        // Payload: análise estrutural por blocos
+        int payloadStart = headerEnd;
+        int payloadLen = a.length - payloadStart;
+        if (payloadLen <= 0) {
+            return hdrScore100;
         }
 
-        return (score * 100) / maxScore;
+        int blockLen = Math.max(1, payloadLen / SIMILARITY_BLOCKS);
+        long totalBlockScore = 0;
+        int blocksUsed = 0;
+
+        for (int bi = 0; bi < SIMILARITY_BLOCKS; bi++) {
+            int start = payloadStart + bi * blockLen;
+            int end = (bi == SIMILARITY_BLOCKS - 1) ? a.length : Math.min(start + blockLen, a.length);
+            if (end <= start) continue;
+            int len = end - start;
+
+            // 1) Média
+            long sumA = 0, sumB = 0;
+            for (int i = start; i < end; i++) {
+                sumA += (a[i] & 0xFF);
+                sumB += (b[i] & 0xFF);
+            }
+            float meanA = sumA / (float) len;
+            float meanB = sumB / (float) len;
+            int meanSim = Math.max(0, 100 - (int)(Math.abs(meanA - meanB) * 100f / 255f));
+
+            // 2) Desvio padrão (proxy de variância)
+            float varA = 0, varB = 0;
+            for (int i = start; i < end; i++) {
+                float da = (a[i] & 0xFF) - meanA;
+                float db = (b[i] & 0xFF) - meanB;
+                varA += da * da;
+                varB += db * db;
+            }
+            float stdDiff = Math.abs((float)Math.sqrt(varA / len) - (float)Math.sqrt(varB / len));
+            int varSim = Math.max(0, 100 - (int)(stdDiff * 100f / 127.5f));
+
+            // 3) Gradiente médio entre bytes adjacentes
+            long gradA = 0, gradB = 0;
+            for (int i = start; i < end - 1; i++) {
+                gradA += Math.abs((a[i] & 0xFF) - (a[i + 1] & 0xFF));
+                gradB += Math.abs((b[i] & 0xFF) - (b[i + 1] & 0xFF));
+            }
+            float gDiff = (len > 1)
+                    ? Math.abs(gradA / (float)(len - 1) - gradB / (float)(len - 1))
+                    : 0f;
+            int gradSim = Math.max(0, 100 - (int)(gDiff * 100f / 255f));
+
+            // Combina: média 50%, variância 25%, gradiente 25%
+            totalBlockScore += meanSim * 2 + varSim + gradSim; // max 400 por bloco
+            blocksUsed++;
+        }
+
+        if (blocksUsed == 0) return hdrScore100;
+
+        int payloadScore = (int)(totalBlockScore * 100L / ((long) blocksUsed * 400));
+        // Header: 20%, Payload: 80%
+        return (hdrScore100 * 20 + payloadScore * 80) / 100;
     }
 
     private void analyzeFrameForLocalOptimizations(byte[] data, int length, int frameType) {
@@ -837,23 +906,37 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 currentDynamicBitrate = prefs.bitrate; // inicializa com o bitrate configurado pelo usuário
             }
             if (!bitrateReduced && consecutiveSimilarFrames >= BITRATE_REDUCE_THRESHOLD) {
-                // Cena estável: reduz bitrate para economizar rede
+                // Cena estável: reduz bitrate imediatamente para economizar rede.
+                // A redução é instantânea — o encoder pode baixar agora mesmo.
                 int reducedBitrate = currentDynamicBitrate * (100 - BITRATE_REDUCE_PERCENT) / 100;
                 reducedBitrate = Math.max(reducedBitrate, prefs.bitrate / 4); // floor em 25% do original
                 updateDynamicBitrate(reducedBitrate);
                 currentDynamicBitrate = reducedBitrate;
                 bitrateReduced = true;
-                LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene, " + consecutiveSimilarFrames + " similar frames)");
+                LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene)");
             } else if (bitrateReduced && consecutiveDissimilarFrames >= BITRATE_RESTORE_THRESHOLD) {
-                // Cena mudou: restaura bitrate original.
-                // Zera AMBOS os contadores: similar para evitar re-redução imediata no próximo
-                // ciclo, e dissimilar para que a janela de restauração comece do zero após o reset.
-                updateDynamicBitrate(prefs.bitrate);
-                currentDynamicBitrate = prefs.bitrate;
-                bitrateReduced = false;
-                consecutiveSimilarFrames = 0;
+                // Cena mudou: sobe o bitrate em RAMPA GRADUAL em vez de restaurar tudo de uma vez.
+                // Cada janela de BITRATE_RESTORE_THRESHOLD frames distintos sobe um degrau de
+                // BITRATE_RAMPUP_STEP_PERCENT em direção ao alvo (prefs.bitrate).
+                // Isso evita o spike de rede que causaria congestionamento imediato ao restaurar
+                // do mínimo para o máximo em um único salto.
+                int target = prefs.bitrate;
+                int gap = target - currentDynamicBitrate;
+                int step = Math.max(1, target * BITRATE_RAMPUP_STEP_PERCENT / 100);
+                int nextBitrate = Math.min(target, currentDynamicBitrate + step);
+                updateDynamicBitrate(nextBitrate);
+                currentDynamicBitrate = nextBitrate;
+                // Reinicia o contador dissimilar para aguardar outra janela antes do próximo degrau.
+                // O contador similar também é zerado para não gerar redução imediata após subida.
                 consecutiveDissimilarFrames = 0;
-                LimeLog.info("Bitrate restored to " + prefs.bitrate + " kbps (scene changed)");
+                consecutiveSimilarFrames = 0;
+                if (currentDynamicBitrate >= target) {
+                    // Chegou ao topo: sai do modo reduzido
+                    bitrateReduced = false;
+                    LimeLog.info("Bitrate fully restored to " + target + " kbps");
+                } else {
+                    LimeLog.info("Bitrate ramp-up: " + currentDynamicBitrate + " kbps (target " + target + " kbps, gap " + gap + ")");
+                }
             }
         }
 
@@ -942,32 +1025,36 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             pseudoFrame[i] = currentSample[i] & 0xFF;
         }
 
-        int blockGranularity = Math.max(1, processingMask.getColumns() > 0
-                ? currentSample.length / processingMask.getColumns() : 1);
-
+        // Melhoria 4: iteração 2D — percorre colunas E linhas da grade pseudo-frame.
+        // Antes o loop só percorria blockX com blockY fixo em 0 (análise puramente 1D).
+        // Agora cada bloco (blockX, blockY) da grade PSEUDO_FRAME_COLS × PSEUDO_FRAME_ROWS
+        // é avaliado independentemente, capturando variações em ambos os eixos.
         int processed = 0;
         int copiedDirect = 0;
 
-        for (int blockX = 0; blockX < processingMask.getColumns(); blockX++) {
-            boolean uniform = blockCompressionAnalyzer.isBlockUniform(pseudoFrame, blockX, 0);
-            processingMask.setBlock(blockX, 0, !uniform);
+        for (int blockY = 0; blockY < processingMask.getRows(); blockY++) {
+            for (int blockX = 0; blockX < processingMask.getColumns(); blockX++) {
+                boolean uniform = blockCompressionAnalyzer.isBlockUniform(pseudoFrame, blockX, blockY);
+                processingMask.setBlock(blockX, blockY, !uniform);
 
-            if (uniform) {
-                copiedDirect++;
-            } else {
-                processed++;
-            }
+                if (uniform) {
+                    copiedDirect++;
+                } else {
+                    processed++;
+                }
 
-            if (prefs.adaptiveSharpness) {
-                accumulatedSharpness += adaptiveSharpnessFilter.getSharpnessForBlock(processingMask, blockX, 0);
+                if (prefs.adaptiveSharpness) {
+                    accumulatedSharpness += adaptiveSharpnessFilter.getSharpnessForBlock(processingMask, blockX, blockY);
+                }
             }
         }
 
         if (prefs.adaptiveSharpness) {
             sharpnessFrameCount++;
             if (sharpnessFrameCount >= SHARPNESS_APPLY_INTERVAL) {
-                float avgSharpness = (processingMask.getColumns() > 0)
-                        ? accumulatedSharpness / (sharpnessFrameCount * processingMask.getColumns())
+                int totalBlocks2D = processingMask.getColumns() * processingMask.getRows();
+                float avgSharpness = (totalBlocks2D > 0)
+                        ? accumulatedSharpness / (sharpnessFrameCount * totalBlocks2D)
                         : DEFAULT_SHARPNESS_BASE;
                 // Mapeia sharpness [0-100] para QP invertido: sharpness alto = QP baixo (mais nitidez)
                 int targetQp = SHARPNESS_QP_MAX - Math.round((avgSharpness / 100f) * (SHARPNESS_QP_MAX - SHARPNESS_QP_MIN));
@@ -1419,16 +1506,18 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private void initLocalFrameOptimizationState(int width, int height) {
         int blockSize = prefs.blockSize > 0 ? prefs.blockSize : 16;
 
-        // BUG CORRIGIDO: antes, o BlockCompressionAnalyzer usava `blockSize` (ex: 16) enquanto
-        // a ProcessingMask dividia o espaço usando `blockSize/4` (ex: 4). Isso fazia o loop em
-        // analyzeBlockCompression iterar FRAME_SAMPLE_SIZE/(blockSize/4) blocos (ex: 32), mas o
-        // analyzer calculava startX = blockX * 16, alcançando índices fora do array para blockX
-        // grande, ou cobrindo regiões sobrepostas e não alinhadas com a máscara.
-        // Correção: ambos usam o mesmo blockSize efetivo (blockSize/4), mantendo coerência entre
-        // o número de colunas da máscara e o tamanho de bloco do analyzer.
+        // Melhoria 4: Block Analysis 2D.
+        // A amostra de FRAME_SAMPLE_SIZE bytes é agora organizada como uma grade 2D de
+        // PSEUDO_FRAME_COLS × PSEUDO_FRAME_ROWS pixels em vez de um vetor 1D.
+        // Isso permite que o BlockCompressionAnalyzer e a ProcessingMask trabalhem em
+        // dois eixos reais, tornando a detecção de uniformidade mais representativa da
+        // estrutura espacial do frame (blocos horizontais E verticais, não só horizontal).
+        // O effectiveBlockSize define quantos "pixels" da pseudo-imagem formam um bloco.
         int effectiveBlockSize = Math.max(1, blockSize / 4);
-        this.blockCompressionAnalyzer = new BlockCompressionAnalyzer(effectiveBlockSize, FRAME_SAMPLE_SIZE, 1);
-        this.processingMask = new ProcessingMask(FRAME_SAMPLE_SIZE, 1, effectiveBlockSize);
+        this.blockCompressionAnalyzer = new BlockCompressionAnalyzer(
+                effectiveBlockSize, PSEUDO_FRAME_COLS, PSEUDO_FRAME_ROWS);
+        this.processingMask = new ProcessingMask(
+                PSEUDO_FRAME_COLS, PSEUDO_FRAME_ROWS, effectiveBlockSize);
         this.adaptiveSharpnessFilter = new AdaptiveSharpnessFilter(DEFAULT_SHARPNESS_BASE);
 
         this.hudDetector = new HudDetector(width, height);
