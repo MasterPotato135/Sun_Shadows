@@ -894,40 +894,39 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         if (prefs.bitrateOptimization) {
+            // BUG-FIX-2: sempre parte do bitrate alvo original para a reducao,
+            // nunca do currentDynamicBitrate corrente -- evita reducao composta
+            // (ex: 10000 -> 7000 -> 4900 -> ...) que travava o encoder num bitrate minimo.
             if (currentDynamicBitrate <= 0) {
-                currentDynamicBitrate = prefs.bitrate; // inicializa com o bitrate configurado pelo usuário
+                currentDynamicBitrate = prefs.bitrate;
             }
             if (!bitrateReduced && consecutiveSimilarFrames >= BITRATE_REDUCE_THRESHOLD) {
-                // Cena estável: reduz bitrate imediatamente para economizar rede.
-                // A redução é instantânea — o encoder pode baixar agora mesmo.
-                int reducedBitrate = currentDynamicBitrate * (100 - BITRATE_REDUCE_PERCENT) / 100;
-                reducedBitrate = Math.max(reducedBitrate, prefs.bitrate / 4); // floor em 25% do original
+                // Cena estavel: reduz sobre o bitrate ALVO original, nao o atual.
+                int reducedBitrate = prefs.bitrate * (100 - BITRATE_REDUCE_PERCENT) / 100;
+                reducedBitrate = Math.max(reducedBitrate, prefs.bitrate / 4); // floor em 25%
                 updateDynamicBitrate(reducedBitrate);
                 currentDynamicBitrate = reducedBitrate;
                 bitrateReduced = true;
+                consecutiveSimilarFrames = 0; // reseta para nao reduzir novamente imediatamente
                 LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene)");
             } else if (bitrateReduced && consecutiveDissimilarFrames >= BITRATE_RESTORE_THRESHOLD) {
-                // Cena mudou: sobe o bitrate em RAMPA GRADUAL em vez de restaurar tudo de uma vez.
-                // Cada janela de BITRATE_RESTORE_THRESHOLD frames distintos sobe um degrau de
-                // BITRATE_RAMPUP_STEP_PERCENT em direção ao alvo (prefs.bitrate).
-                // Isso evita o spike de rede que causaria congestionamento imediato ao restaurar
-                // do mínimo para o máximo em um único salto.
+                // Cena mudou: sobe em degraus em direcao ao alvo.
+                // BUG-FIX-1: NAO zera consecutiveDissimilarFrames entre degraus --
+                // o contador acumula normalmente, cada multiplo de BITRATE_RESTORE_THRESHOLD
+                // avanca um degrau. Zera-lo travava o ramp-up porque o encoder ficava preso
+                // num bitrate baixo enquanto recebia frames dinamicos (causava starvation).
                 int target = prefs.bitrate;
-                int gap = target - currentDynamicBitrate;
                 int step = Math.max(1, target * BITRATE_RAMPUP_STEP_PERCENT / 100);
                 int nextBitrate = Math.min(target, currentDynamicBitrate + step);
                 updateDynamicBitrate(nextBitrate);
                 currentDynamicBitrate = nextBitrate;
-                // Reinicia o contador dissimilar para aguardar outra janela antes do próximo degrau.
-                // O contador similar também é zerado para não gerar redução imediata após subida.
-                consecutiveDissimilarFrames = 0;
-                consecutiveSimilarFrames = 0;
                 if (currentDynamicBitrate >= target) {
-                    // Chegou ao topo: sai do modo reduzido
                     bitrateReduced = false;
+                    consecutiveDissimilarFrames = 0;
+                    consecutiveSimilarFrames = 0;
                     LimeLog.info("Bitrate fully restored to " + target + " kbps");
                 } else {
-                    LimeLog.info("Bitrate ramp-up: " + currentDynamicBitrate + " kbps (target " + target + " kbps, gap " + gap + ")");
+                    LimeLog.info("Bitrate ramp-up: " + currentDynamicBitrate + " kbps / " + target + " kbps");
                 }
             }
         }
@@ -2612,7 +2611,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             throw new RendererException(this, exception);
         }
 
-        analyzeFrameForLocalOptimizations(decodeUnitData, decodeUnitLength, frameType);
+        // BUG-FIX: só analisa unidades de vídeo reais — SPS/PPS/VPS são apenas codec config
+        // e têm poucos bytes sem conteúdo visual. Amostrar esses buffers envenena lastFrameSample
+        // com dados inválidos, gerando similaridades falsas e redução de bitrate prematura logo
+        // nos primeiros segundos (crash "instável" que ocorria ~segundos após entrar).
+        if (decodeUnitType == MoonBridge.BUFFER_TYPE_PICDATA) {
+            analyzeFrameForLocalOptimizations(decodeUnitData, decodeUnitLength, frameType);
+        }
 
         // FIX-4: Area deduplication — descarta o frame ANTES de copiar para o decoder.
         // Correção: o nextInputBuffer já foi obtido via fetchNextInputBuffer() acima.
