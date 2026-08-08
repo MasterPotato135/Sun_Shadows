@@ -301,6 +301,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private LinkedBlockingQueue<OutputFrame> outputBufferQueue = new LinkedBlockingQueue<>();
     private static final int OUTPUT_BUFFER_QUEUE_LIMIT = 2;
     private long lastRenderedFrameTimeNanos;
+
+    // Controlador de frame pacing baseado em histórico real de intervalos.
+    // Substitui o sistema de curvas fixas (linear/ease/cubic/etc.) por um
+    // scheduler que mede avg interval + jitter e decide quando apresentar cada frame.
+    private FramePacingController framePacingController;
     private HandlerThread choreographerHandlerThread;
     private Handler choreographerHandler;
 
@@ -1144,93 +1149,92 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
      *  4) transitionFrameMode=0 + localMotionSmoothing=true caía no default de 25%, mas
      *     agora usa corretamente prefs.transitionStrength com o tipo configurado.
      */
+    /**
+     * Inicializa (ou reinicializa) o FramePacingController com o modo correto
+     * derivado das prefs legadas + novas.
+     *
+     * Mapeamento de prefs → modo:
+     *   localMotionSmoothing || transitionFrameMode == 1 → LOW_LATENCY (1)
+     *   transitionFrameMode == 2 || transitionStrength ∈ [1,50] → BALANCED (2)
+     *   transitionFrameMode == 3 || transitionStrength > 50      → SMOOTH   (3)
+     *   Qualquer interp type != NONE + strength == 0 → BALANCED por padrão
+     */
+    private void initFramePacingController() {
+        int mode;
+        if (prefs.transitionStrength > 50) {
+            mode = FramePacingController.MODE_SMOOTH;
+        } else if (prefs.transitionStrength > 0 || prefs.transitionFrameMode == 2) {
+            mode = FramePacingController.MODE_BALANCED;
+        } else if (prefs.transitionFrameMode == 3) {
+            mode = FramePacingController.MODE_SMOOTH;
+        } else if (prefs.localMotionSmoothing || prefs.transitionFrameMode == 1) {
+            mode = FramePacingController.MODE_LOW_LATENCY;
+        } else if (prefs.transitionInterpolationType != PreferenceConfiguration.TRANSITION_INTERP_NONE) {
+            // Curva selecionada mas sem força/modo explícito → Balanced
+            mode = FramePacingController.MODE_BALANCED;
+        } else {
+            // Nenhuma suavização ativa
+            mode = FramePacingController.MODE_LOW_LATENCY;
+        }
+        if (framePacingController == null) {
+            framePacingController = new FramePacingController(mode, refreshRate > 0 ? refreshRate : 60);
+        } else {
+            framePacingController.setMode(mode, refreshRate > 0 ? refreshRate : 60);
+            framePacingController.reset();
+        }
+    }
+
+    /**
+     * Retorna o timestamp de apresentação ajustado pelo FramePacingController.
+     *
+     * Chamado em dois contextos:
+     *   1) rendererThread (não-Balanced): frameTimeNanos = System.nanoTime()
+     *   2) Choreographer callback (Balanced): frameTimeNanos = vsync timestamp
+     *
+     * Se o pacing não está ativo (nenhuma pref de suavização ligada), retorna
+     * frameTimeNanos sem modificação.
+     *
+     * SUBSTITUIÇÃO DO SISTEMA DE CURVAS FIXAS:
+     * O sistema anterior aplicava uma curva matemática (linear/ease/cubic/etc.)
+     * ao timestamp sem saber se o frame estava atrasado ou adiantado. O novo
+     * sistema mede o intervalo real entre frames, calcula avg + jitter, e usa
+     * um scheduler que avança frame a frame — corrigindo drift sem curva fixa.
+     */
     private long getSmoothedRenderTimeNanos(long frameTimeNanos) {
-        // Qualquer um dos três controles pode ativar a interpolação independentemente:
-        // - transitionFrameMode: modo legado (1/2/3 = 25/50/75%)
-        // - transitionStrength > 0: força explícita via seekbar
-        // - transitionInterpolationType != NONE: curva selecionada (implica ativação com strength padrão)
-        // - localMotionSmoothing: suavização leve legada
-        boolean transitionActive = prefs.transitionFrameMode > 0
+        boolean pacingActive = prefs.transitionFrameMode > 0
                 || prefs.localMotionSmoothing
                 || prefs.transitionStrength > 0
                 || prefs.transitionInterpolationType != PreferenceConfiguration.TRANSITION_INTERP_NONE;
-        if (!transitionActive) {
+
+        if (!pacingActive) {
             return frameTimeNanos;
         }
 
-        // Respeita a frequência mínima entre frames interpolados
-        if (prefs.transitionFrequencyMs > 0 && refreshRate > 0) {
-            long frameDurationMs = 1000L / refreshRate;
-            if (frameDurationMs < prefs.transitionFrequencyMs) {
-                // Taxa de frames maior que a frequência de transição configurada: sem interpolação
-                return frameTimeNanos;
-            }
-        }
-
-        // Força vem da preferência direta (0–100); legado: transitionFrameMode mapeia para
-        // defaults de 25/50/75/100 quando transitionStrength não foi configurado explicitamente.
-        int strengthPercent;
-        if (prefs.transitionStrength > 0) {
-            strengthPercent = Math.min(100, prefs.transitionStrength);
-        } else {
-            // Compatibilidade retroativa: mapeia modos legados para forças fixas
-            switch (prefs.transitionFrameMode) {
-                case 1: strengthPercent = 25; break;
-                case 2: strengthPercent = 50; break;
-                case 3: strengthPercent = 75; break;
-                default: strengthPercent = prefs.localMotionSmoothing ? 25 : 0; break;
-            }
-        }
-
-        if (strengthPercent == 0 || refreshRate <= 0) {
-            return frameTimeNanos;
+        // Lazy init / reinit se ainda não foi criado
+        if (framePacingController == null) {
+            initFramePacingController();
         }
 
         activeWindowVideoStats.framesSmoothedLocally++;
-        long frameDurationNs = 1000000000L / refreshRate;
 
-        // Calcula o fator de progresso normalizado t ∈ [0, 1] com base no tempo decorrido
-        // desde o último frame renderizado, para suavizar a curva de interpolação.
-        float t;
-        if (lastRenderedFrameTimeNanos > 0 && frameDurationNs > 0) {
-            t = Math.max(0f, Math.min(1f,
-                    (float)(frameTimeNanos - lastRenderedFrameTimeNanos) / frameDurationNs));
-        } else {
-            t = 1f;
+        // Registra chegada e obtém timestamp de apresentação ajustado
+        return framePacingController.onFrameArrived(frameTimeNanos);
+    }
+
+    /**
+     * Versão para o Choreographer callback — não registra chegada de novo frame,
+     * apenas pede o timestamp de apresentação correto para o vsync atual.
+     */
+    private long getChoreographerRenderTimeNanos(long vsyncNanos) {
+        boolean pacingActive = prefs.transitionFrameMode > 0
+                || prefs.localMotionSmoothing
+                || prefs.transitionStrength > 0
+                || prefs.transitionInterpolationType != PreferenceConfiguration.TRANSITION_INTERP_NONE;
+
+        if (!pacingActive || framePacingController == null) {
+            return vsyncNanos;
         }
-
-        // Aplica a curva de interpolação selecionada pelo usuário
-        float factor;
-        switch (prefs.transitionInterpolationType) {
-            case PreferenceConfiguration.TRANSITION_INTERP_NONE:
-                // Sem suavização de curva: offset linear fixo baseado apenas na força
-                factor = strengthPercent / 100f;
-                break;
-            case PreferenceConfiguration.TRANSITION_INTERP_EASE_IN_OUT:
-                // Hermite quadrático: suave no início e no fim, rápido no meio
-                factor = (t < 0.5f ? 2f * t * t : -1f + (4f - 2f * t) * t) * (strengthPercent / 100f);
-                break;
-            case PreferenceConfiguration.TRANSITION_INTERP_CUBIC:
-                // Smoothstep cúbico (3t²-2t³): curva S suave e equilibrada
-                factor = (t * t * (3f - 2f * t)) * (strengthPercent / 100f);
-                break;
-            case PreferenceConfiguration.TRANSITION_INTERP_EXPONENTIAL:
-                // Exponencial: arranque lento com aceleração progressiva (bom para ação rápida)
-                factor = (t == 0f ? 0f : (float) Math.pow(2.0, 10.0 * t - 10.0)) * (strengthPercent / 100f);
-                break;
-            case PreferenceConfiguration.TRANSITION_INTERP_SMOOTH_STEP:
-                // Smooth-step Ken Perlin (6t⁵-15t⁴+10t³): derivada zero nas pontas, ideal para
-                // transições que precisam "travar" suavemente no início e no fim do frame.
-                factor = (t * t * t * (t * (t * 6f - 15f) + 10f)) * (strengthPercent / 100f);
-                break;
-            case PreferenceConfiguration.TRANSITION_INTERP_LINEAR:
-            default:
-                // Linear: proporcional direto ao progresso (comportamento original)
-                factor = t * (strengthPercent / 100f);
-                break;
-        }
-
-        return frameTimeNanos + (long)(frameDurationNs * factor);
+        return framePacingController.getRenderTimeNanos(vsyncNanos);
     }
 
     private void configureAndStartDecoder(MediaFormat format) {
@@ -1488,6 +1492,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.consecutiveDissimilarFrames = 0;
         this.currentDynamicBitrate = 0;
         this.bitrateReduced = false;
+
+        // Inicializa/reseta o FramePacingController com o modo derivado das prefs atuais.
+        // Feito aqui (e não em setup()) para garantir reinicialização correta após recovery.
+        initFramePacingController();
     }
 
     // All threads that interact with the MediaCodec instance must call this function regularly!
@@ -1526,6 +1534,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 lastFrameSample = null;          // força nova baseline de comparação pós-recovery
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
                 areaDedupFrameCounter = 0;
+                // Reset do pacing controller — garante que âncoras e histórico de intervalos
+                // não reflitam o estado pré-falha, evitando timestamps incorretos pós-IDR.
+                if (framePacingController != null) framePacingController.reset();
                 // Restaura bitrate original após recovery — não manter redução de bitrate
                 // de antes da falha do codec, que poderia impedir a recuperação correta.
                 if (bitrateReduced) {
@@ -1799,7 +1810,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         videoDecoder.releaseOutputBuffer(nextOutputFrame.index, false);
                     }
                     else {
-                        long renderTimeNanos = getSmoothedRenderTimeNanos(frameTimeNanos);
+                        // Choreographer callback: usa getRenderTimeNanos sem registrar nova chegada.
+                        // O registro de chegada acontece no rendererThread via onFrameArrived.
+                        long renderTimeNanos = getChoreographerRenderTimeNanos(frameTimeNanos);
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                             videoDecoder.releaseOutputBuffer(nextOutputFrame.index, renderTimeNanos);
                         }
@@ -2833,6 +2846,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             str += "Average end-to-end client latency: "+renderer.getAverageEndToEndLatency()+"ms"+DELIMITER;
             str += "Average hardware decoder latency: "+renderer.getAverageDecoderLatency()+"ms"+DELIMITER;
             str += "Frame pacing mode: "+renderer.prefs.framePacing+DELIMITER;
+            if (renderer.framePacingController != null) {
+                long avgUs = renderer.framePacingController.measuredAvgIntervalNs / 1_000_000L;
+                long jitterUs = renderer.framePacingController.measuredJitterNs / 1_000_000L;
+                str += "Pacing controller mode: "+renderer.framePacingController.getMode()+DELIMITER;
+                str += "Avg frame interval: "+avgUs+"ms (jitter: "+jitterUs+"ms)"+DELIMITER;
+                str += "Late/Early frames: "+renderer.framePacingController.lateFrames+"/"+renderer.framePacingController.earlyFrames+DELIMITER;
+                str += "Pacing resets (gap): "+renderer.framePacingController.dropGaps+DELIMITER;
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 if (originalException instanceof CodecException) {

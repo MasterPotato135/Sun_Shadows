@@ -359,6 +359,200 @@ class AdaptiveSharpnessFilter {
  * - O último frame decodificado permanece na surface durante o freeze local
  * - Bytes já foram recebidos pela rede → sem economia de banda, apenas CPU de decode
  */
+/**
+ * // main/java/com/limelight/binding/video/VideoStats.java
+ * Controlador de frame pacing baseado em histórico real de chegada de frames.
+ *
+ * Em vez de aplicar uma curva matemática fixa ao timestamp, mantém um histórico
+ * circular dos últimos N intervalos entre frames e usa a média + jitter medidos
+ * para decidir QUANDO cada frame deve ser apresentado.
+ *
+ * MODOS DE BUFFER:
+ *   LOW_LATENCY  (buffer=1): apresenta imediatamente, sem suavização
+ *   BALANCED     (buffer=2): suaviza jitter leve, latência +1 frame
+ *   SMOOTH       (buffer=3): suaviza jitter intenso, latência +2 frames
+ *
+ * DETECÇÃO DE GAPS:
+ *   - gap pequeno  (< 2× intervalo esperado): suaviza gradualmente
+ *   - gap grande   (≥ 2× e < 5× esperado):   recupera rápido
+ *   - gap enorme   (≥ 5× esperado / drop run): reset do scheduler
+ *
+ * SAÍDA:
+ *   getRenderTimeNanos() retorna o timestamp de apresentação ajustado para
+ *   uso em releaseOutputBuffer(index, renderTimeNanos). Nunca retorna um valor
+ *   no passado — garante mínimo de "agora + 1ms" para não ser dropped pelo SurfaceFlinger.
+ */
+class FramePacingController {
+
+    // Modos de buffer de apresentação
+    static final int MODE_LOW_LATENCY = 1;
+    static final int MODE_BALANCED    = 2;
+    static final int MODE_SMOOTH      = 3;
+
+    // Tamanho do histórico circular de intervalos entre frames
+    private static final int HISTORY_SIZE = 16;
+
+    // Limites de gap para classificação
+    private static final float GAP_SMALL_MULTIPLIER  = 2.0f;
+    private static final float GAP_LARGE_MULTIPLIER  = 5.0f;
+
+    // Quanto do jitter permitimos antes de considerar "atrasado"
+    private static final float JITTER_TOLERANCE_NS   = 4_000_000f; // 4ms
+
+    // Mínimo de tempo no futuro para não ser dropped pelo SurfaceFlinger
+    private static final long  MIN_AHEAD_NS          = 1_000_000L; // 1ms
+
+    private final long[] intervalHistory = new long[HISTORY_SIZE];
+    private int historyHead  = 0;
+    private int historyCount = 0;
+
+    private long lastArrivalNs = 0;
+    private long baseRenderNs  = 0; // âncora do scheduler
+
+    private int  mode;
+    private long targetIntervalNs; // estimativa corrente do intervalo ideal
+
+    // Stats expostas para o perf overlay
+    volatile long   measuredAvgIntervalNs;
+    volatile long   measuredJitterNs;
+    volatile int    lateFrames;
+    volatile int    earlyFrames;
+    volatile int    dropGaps;
+
+    FramePacingController(int mode, int displayRefreshRate) {
+        setMode(mode, displayRefreshRate);
+    }
+
+    void setMode(int mode, int displayRefreshRate) {
+        this.mode = Math.max(MODE_LOW_LATENCY, Math.min(MODE_SMOOTH, mode));
+        // Estimativa inicial: display refresh rate como fallback
+        this.targetIntervalNs = (displayRefreshRate > 0)
+                ? (1_000_000_000L / displayRefreshRate)
+                : 16_666_667L; // 60 fps fallback
+    }
+
+    /**
+     * Registra a chegada de um novo frame (em nanos) e calcula o timestamp
+     * de apresentação ideal.
+     *
+     * @param arrivalNs  System.nanoTime() no momento de chegada do frame
+     * @return           timestamp para releaseOutputBuffer (sempre ≥ agora + 1ms)
+     */
+    long onFrameArrived(long arrivalNs) {
+        // --- 1. Mede o intervalo desde o último frame ---
+        if (lastArrivalNs > 0) {
+            long interval = arrivalNs - lastArrivalNs;
+            recordInterval(interval);
+            classifyFrame(interval);
+        }
+        lastArrivalNs = arrivalNs;
+
+        // --- 2. Recalcula stats ---
+        updateStats();
+
+        // --- 3. Avança o scheduler ---
+        long avg = (historyCount > 0) ? measuredAvgIntervalNs : targetIntervalNs;
+        if (avg > 0) targetIntervalNs = avg;
+
+        if (baseRenderNs == 0) {
+            // Primeira âncora
+            baseRenderNs = arrivalNs;
+        } else {
+            baseRenderNs += targetIntervalNs;
+        }
+
+        // --- 4. Detecta gap e reage ---
+        long drift = baseRenderNs - arrivalNs;
+        long absGap = Math.abs(drift);
+
+        if (absGap >= GAP_LARGE_MULTIPLIER * targetIntervalNs) {
+            // Gap enorme: reset — provavelmente houve stall de rede ou pausa longa
+            baseRenderNs = arrivalNs;
+            dropGaps++;
+        } else if (absGap >= GAP_SMALL_MULTIPLIER * targetIntervalNs) {
+            // Gap grande: recupera metade da distância imediatamente
+            baseRenderNs = arrivalNs + (drift > 0 ? targetIntervalNs / 2 : 0);
+            dropGaps++;
+        }
+        // Gap pequeno: deixa o scheduler avançar naturalmente
+
+        // --- 5. Aplica offset de buffer por modo ---
+        long bufferOffsetNs = (mode - 1) * targetIntervalNs; // 0, 1×, 2× frame
+        long renderNs = baseRenderNs + bufferOffsetNs;
+
+        // --- 6. Garante mínimo no futuro ---
+        long nowNs = System.nanoTime();
+        if (renderNs < nowNs + MIN_AHEAD_NS) {
+            renderNs = nowNs + MIN_AHEAD_NS;
+            // Ressincroniza âncora para não acumular atraso
+            baseRenderNs = renderNs - bufferOffsetNs;
+        }
+
+        return renderNs;
+    }
+
+    /** Versão sem registro de chegada — para uso no Choreographer callback. */
+    long getRenderTimeNanos(long choreographerFrameNs) {
+        if (baseRenderNs == 0) return choreographerFrameNs;
+        long bufferOffsetNs = (mode - 1) * targetIntervalNs;
+        long renderNs = baseRenderNs + bufferOffsetNs;
+        long nowNs = System.nanoTime();
+        if (renderNs < nowNs + MIN_AHEAD_NS) {
+            renderNs = nowNs + MIN_AHEAD_NS;
+        }
+        return renderNs;
+    }
+
+    private void recordInterval(long intervalNs) {
+        // Filtra intervalos impossíveis (< 1ms ou > 500ms) para não poluir a média
+        if (intervalNs < 1_000_000L || intervalNs > 500_000_000L) return;
+        intervalHistory[historyHead] = intervalNs;
+        historyHead = (historyHead + 1) % HISTORY_SIZE;
+        historyCount = Math.min(historyCount + 1, HISTORY_SIZE);
+    }
+
+    private void classifyFrame(long intervalNs) {
+        if (historyCount == 0 || targetIntervalNs <= 0) return;
+        float ratio = intervalNs / (float) targetIntervalNs;
+        if (ratio > 1f + (JITTER_TOLERANCE_NS / targetIntervalNs)) {
+            lateFrames++;
+        } else if (ratio < 1f - (JITTER_TOLERANCE_NS / targetIntervalNs)) {
+            earlyFrames++;
+        }
+    }
+
+    private void updateStats() {
+        if (historyCount == 0) return;
+        long sum = 0;
+        long min = Long.MAX_VALUE;
+        long max = Long.MIN_VALUE;
+        for (int i = 0; i < historyCount; i++) {
+            long v = intervalHistory[i];
+            sum += v;
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        measuredAvgIntervalNs = sum / historyCount;
+        measuredJitterNs      = max - min;
+    }
+
+    /** Reset completo — chamar junto com o reset do decoder. */
+    void reset() {
+        historyHead  = 0;
+        historyCount = 0;
+        lastArrivalNs = 0;
+        baseRenderNs  = 0;
+        lateFrames    = 0;
+        earlyFrames   = 0;
+        dropGaps      = 0;
+        measuredAvgIntervalNs = 0;
+        measuredJitterNs      = 0;
+    }
+
+    int getMode()               { return mode; }
+    long getTargetIntervalNs()  { return targetIntervalNs; }
+}
+
 class AreaDeduplicator {
 
     private final int gridSize;
