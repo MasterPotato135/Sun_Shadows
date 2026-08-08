@@ -926,16 +926,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         long startNs = System.nanoTime();
 
-        // FIX-3: reutiliza pseudoFrameBuffer alocado uma vez em initLocalFrameOptimizationState
-        // em vez de criar new int[N] a cada frame (~60x/s), eliminando pressão de GC no
-        // caminho quente que causava CodecException transiente no input thread.
+        // FIX-3: reutiliza pseudoFrameBuffer alocado uma vez em initLocalFrameOptimizationState.
+        // Antes usava conversão ARGB (gray << 16 | gray << 8 | gray) que não adicionava
+        // informação — o detector de uniformidade compara valores inteiros, então usar o
+        // byte unsigned diretamente (& 0xFF) como int é equivalente e mais honesto:
+        // ainda é uma heurística sobre bytes comprimidos, não pixels, mas sem conversão fake.
         if (pseudoFrameBuffer == null || pseudoFrameBuffer.length != currentSample.length) {
             pseudoFrameBuffer = new int[currentSample.length];
         }
         int[] pseudoFrame = pseudoFrameBuffer;
         for (int i = 0; i < currentSample.length; i++) {
-            int gray = currentSample[i] & 0xFF;
-            pseudoFrame[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+            pseudoFrame[i] = currentSample[i] & 0xFF;
         }
 
         int blockGranularity = Math.max(1, processingMask.getColumns() > 0
@@ -971,8 +972,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     try {
                         Bundle params = new Bundle();
-                        params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, prefs.bitrate * 1000);
-                        // Aplica QP ao decoder para orientar o pipeline de qualidade de vídeo
+                        // Aplica QP ao decoder para orientar o pipeline de qualidade de vídeo.
+                        // Não incluímos PARAMETER_KEY_VIDEO_BITRATE aqui: esse parâmetro
+                        // é para encoders, não decoders — enviá-lo a um decoder é ignorado
+                        // ou causa comportamento indefinido dependendo do fabricante.
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                             params.putInt("video-qp-p-max", targetQp);
                             params.putInt("video-qp-p-min", Math.max(SHARPNESS_QP_MIN, targetQp - 10));
@@ -1037,10 +1040,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 }
 
                 if (hudRepeatStreakByRegion[idx] >= 3) {
-                    // Região repetitiva não-central: aplica MUITA menos resolução aqui,
-                    // proporcional a quantas vezes repetiu (quanto mais repete, mais reduz).
+                    // Região repetitiva não-central: calcula redução proporcional ao streak.
                     int maxReduction = Math.max(0, Math.min(100, prefs.hudResolutionReduction));
-                    hudDetector.computeResolutionReduction(hudRepeatStreakByRegion[idx], maxReduction);
+                    int reduction = hudDetector.computeResolutionReduction(hudRepeatStreakByRegion[idx], maxReduction);
+                    // Conecta o resultado ao area dedup: se a redução calculada for >= 50%,
+                    // essa região está suficientemente estática para pular o próximo frame
+                    // que a contenha. Incrementa pendingAreaReplacementFrames para sinalizar
+                    // ao submitDecodeUnit que o próximo frame pode ser descartado antes do decode.
+                    if (prefs.areaDeduplicationEnabled && reduction >= 50
+                            && pendingAreaReplacementFrames == 0) {
+                        pendingAreaReplacementFrames = 1;
+                    }
                     hudDetected++;
                 } else {
                     hudSkipped++;

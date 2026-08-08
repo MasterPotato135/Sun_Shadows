@@ -84,7 +84,7 @@ android {
             applicationIdSuffix ".debug"
             resValue "string", "app_label", "Sun Shadows"
             resValue "string", "app_label_root", "Moonlight (Root Debug)"
-
+ 
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }

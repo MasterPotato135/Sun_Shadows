@@ -186,33 +186,27 @@ class BlockCompressionAnalyzer {
         this.frameHeight = frameHeight;
     }
     
+    // frameData contém bytes do bitstream comprimido convertidos para int (0-255).
+    // Compara cada elemento amostrado com o valor central do bloco; se a diferença
+    // absoluta ultrapassar UNIFORMITY_THRESHOLD, o bloco é considerado não-uniforme.
     boolean isBlockUniform(int[] frameData, int blockX, int blockY) {
         int startX = blockX * blockSize;
         int startY = blockY * blockSize;
         int endX = Math.min(startX + blockSize, frameWidth);
         int endY = Math.min(startY + blockSize, frameHeight);
-        
+
         if (endX <= startX || endY <= startY) return true;
-        
-        int centerPixelIdx = (startY + blockSize / 2) * frameWidth + (startX + blockSize / 2);
-        if (centerPixelIdx >= frameData.length) return true;
-        
-        int refPixel = frameData[centerPixelIdx];
-        int refR = (refPixel >> 16) & 0xFF;
-        int refG = (refPixel >> 8) & 0xFF;
-        int refB = refPixel & 0xFF;
-        
+
+        int centerIdx = (startY + (endY - startY) / 2) * frameWidth + (startX + (endX - startX) / 2);
+        if (centerIdx >= frameData.length) return true;
+
+        int refVal = frameData[centerIdx]; // valor 0-255 direto
+
         for (int y = startY; y < endY; y += Math.max(1, blockSize / 4)) {
             for (int x = startX; x < endX; x += Math.max(1, blockSize / 4)) {
-                int pixelIdx = y * frameWidth + x;
-                if (pixelIdx >= frameData.length) continue;
-                
-                int pixel = frameData[pixelIdx];
-                int r = (pixel >> 16) & 0xFF;
-                int g = (pixel >> 8) & 0xFF;
-                int b = pixel & 0xFF;
-                
-                if (Math.abs(r - refR) + Math.abs(g - refG) + Math.abs(b - refB) > UNIFORMITY_THRESHOLD) {
+                int idx = y * frameWidth + x;
+                if (idx >= frameData.length) continue;
+                if (Math.abs(frameData[idx] - refVal) > UNIFORMITY_THRESHOLD) {
                     return false;
                 }
             }
