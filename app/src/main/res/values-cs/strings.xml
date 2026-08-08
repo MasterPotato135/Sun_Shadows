@@ -293,7 +293,6 @@
 
 <string name="local_upscaling_bilinear">Bilineární</string>
 <string name="local_upscaling_lanczos">Lanczos</string>
-<string name="local_upscaling_hud_detection">Detekce HUD</string>
 
 <string name="title_checkbox_prefer_audio_over_video">Upřednostnit zvuk před videem</string>
 <string name="summary_checkbox_prefer_audio_over_video">Udržuje plynulý zvuk a omezuje přerušení za cenu menší plynulosti videa</string>

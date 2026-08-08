@@ -24,13 +24,11 @@ class VideoStats {
     int framesWithHostProcessingLatency;
     long measurementStartTimestamp;
     
-    // Block compression + Adaptive processing + HUD detection stats
+    // Block compression + Adaptive processing stats
     int blocksProcessed;
     int blocksCopiedDirect;
-    int hudElementsDetected;
-    int hudRegionsSkipped;
+
     long blockAnalysisTimeMs;
-    long hudDetectionTimeMs;
 
     // Deduplicação de áreas
     int areaPatternsDetected;
@@ -64,10 +62,7 @@ class VideoStats {
         // Block compression stats
         this.blocksProcessed += other.blocksProcessed;
         this.blocksCopiedDirect += other.blocksCopiedDirect;
-        this.hudElementsDetected += other.hudElementsDetected;
-        this.hudRegionsSkipped += other.hudRegionsSkipped;
         this.blockAnalysisTimeMs += other.blockAnalysisTimeMs;
-        this.hudDetectionTimeMs += other.hudDetectionTimeMs;
 
         // Deduplicação de áreas
         this.areaPatternsDetected += other.areaPatternsDetected;
@@ -104,10 +99,7 @@ class VideoStats {
         // Block compression stats
         this.blocksProcessed = other.blocksProcessed;
         this.blocksCopiedDirect = other.blocksCopiedDirect;
-        this.hudElementsDetected = other.hudElementsDetected;
-        this.hudRegionsSkipped = other.hudRegionsSkipped;
         this.blockAnalysisTimeMs = other.blockAnalysisTimeMs;
-        this.hudDetectionTimeMs = other.hudDetectionTimeMs;
 
         // Deduplicação de áreas
         this.areaPatternsDetected = other.areaPatternsDetected;
@@ -138,10 +130,7 @@ class VideoStats {
         // Block compression stats
         this.blocksProcessed = 0;
         this.blocksCopiedDirect = 0;
-        this.hudElementsDetected = 0;
-        this.hudRegionsSkipped = 0;
         this.blockAnalysisTimeMs = 0;
-        this.hudDetectionTimeMs = 0;
 
         // Deduplicação de áreas
         this.areaPatternsDetected = 0;
@@ -214,88 +203,6 @@ class BlockCompressionAnalyzer {
         return true;
     }
 }
-
-/**
- * // main/java/com/limelight/binding/video/VideoStats.java
- * Detctor de HUD adaptativo.
- * Identifica elementos HUD (menus, placar) que repetem frame-to-frame.
- * Aplica menor resolução nessas áreas para economizar bandwidth.
- */
-class HudDetector {
-    private int frameWidth;
-    private int frameHeight;
-    private int[] previousFrameHash;
-    private static final int REPEATFRAME_THRESHOLD = (int) (0.95f * 255);  // 95% similar
-    
-    HudDetector(int frameWidth, int frameHeight) {
-        this.frameWidth = frameWidth;
-        this.frameHeight = frameHeight;
-        this.previousFrameHash = null;
-    }
-    
-    boolean isHudRegion(int[] frameData, int regionX, int regionY, int regionSize) {
-        if (previousFrameHash == null) {
-            previousFrameHash = new int[frameData.length];
-            System.arraycopy(frameData, 0, previousFrameHash, 0, frameData.length);
-            return false;
-        }
-
-        // BUG CORRIGIDO: a cópia do frame atual para previousFrameHash foi movida para fora
-        // deste método. Antes, a cópia era feita aqui dentro, o que fazia com que chamadas
-        // subsequentes para regiões do mesmo frame comparassem contra o frame ATUAL (já copiado)
-        // em vez do frame ANTERIOR. O chamador deve invocar updatePreviousFrame() uma única vez
-        // após processar todas as regiões do frame.
-        int startIdx = regionY * frameWidth + regionX;
-        int identicalPixels = 0;
-        int totalPixels = 0;
-
-        for (int y = 0; y < regionSize && regionY + y < frameHeight; y++) {
-            for (int x = 0; x < regionSize && regionX + x < frameWidth; x++) {
-                int idx = startIdx + y * frameWidth + x;
-                if (idx < frameData.length && frameData[idx] == previousFrameHash[idx]) {
-                    identicalPixels++;
-                }
-                totalPixels++;
-            }
-        }
-
-        return totalPixels > 0 && (identicalPixels / (float) totalPixels) > 0.85f;
-    }
-
-    /**
-     * Deve ser chamado UMA VEZ pelo chamador após processar todas as regiões do frame atual,
-     * para atualizar o histórico para o próximo frame. Separado de isHudRegion para evitar
-     * que a cópia do frame corrompesse comparações de regiões subsequentes no mesmo frame.
-     */
-    void updatePreviousFrame(int[] frameData) {
-        if (previousFrameHash == null || previousFrameHash.length != frameData.length) {
-            previousFrameHash = new int[frameData.length];
-        }
-        System.arraycopy(frameData, 0, previousFrameHash, 0, frameData.length);
-    }
-
-    /**
-     * Calcula, com base em quantas vezes uma região se repetiu recentemente,
-     * o quanto sua resolução pode ser reduzida (0-100%).
-     * Regiões que repetem muito (ex.: HUD, minimapa, contador de munição)
-     * recebem mais redução; regiões pouco repetitivas recebem pouca ou nenhuma.
-     */
-    int computeResolutionReduction(int repeatStreak, int maxReductionPercent) {
-        if (repeatStreak <= 0) {
-            return 0;
-        }
-        // Cresce rapidamente nos primeiros repeats e satura em maxReductionPercent
-        int reduction = Math.min(maxReductionPercent, repeatStreak * 10);
-        return reduction;
-    }
-}
-
-/**
- * // main/java/com/limelight/binding/video/VideoStats.java
- * Máscara de processamento por blocos.
- * Guarda, para cada bloco do frame, se ele precisa de processamento (■, há detalhes)
- * ou pode ser copiado direto (□, uniforme). Evita gastar CPU em céu, paredes, neblina, menus etc.
- */
 class ProcessingMask {
     private final int columns;
     private final int rows;

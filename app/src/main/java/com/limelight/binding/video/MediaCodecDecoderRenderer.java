@@ -32,38 +32,31 @@
 //      AdaptiveSharpnessFilter. Não há compressão nem modificação do stream
 //      transmitido — o frame original segue inalterado para o decoder.
 //
-//  [4] HUD Detection (detecção e cálculo — sem redução efetiva de resolução no stream)
-//      Rastreia regiões não-centrais que repetem entre frames (HUD, minimapa,
-//      munição) e calcula um percentual de "redução de resolução possível".
-//      Esse valor é informativo: o Android recebe um stream H.264/HEVC já
-//      codificado pelo PC — não é possível alterar a resolução de uma região
-//      do stream recebido sem modificar o encoder remoto.
-//
-//  [5] Area Deduplication (descarte pré-decoder — economiza CPU de decodificação)
+//  [4] Area Deduplication (descarte pré-decoder — economiza CPU de decodificação)
 //      A cada N frames (areaDedupCheckInterval), analisa os últimos Y frames
 //      e detecta sub-regiões estáveis (mesma amostra de bytes). Quando um
 //      padrão é encontrado, os próximos Z frames são descartados ANTES de
 //      entrar no decoder via queueInputBuffer(size=0), economizando CPU de
 //      decodificação. Não economiza banda de rede (bytes já recebidos).
 //
-//  [6] Adaptive Sharpness (cálculo de intensidade por bloco — sem pipeline de vídeo)
+//  [5] Adaptive Sharpness (cálculo de intensidade por bloco — sem pipeline de vídeo)
 //      Usa a ProcessingMask do Block Analysis para calcular a intensidade de
 //      nitidez por bloco (0 em regiões uniformes, baseSharpness+20 em regiões
 //      com detalhe). O valor calculado é retornado por getSharpnessForBlock()
 //      mas não é aplicado por um pipeline de pós-processamento de vídeo —
 //      aguarda integração futura com filtros de superfície/shader.
 //
-//  [7] Frame Pacing / Motion Smoothing (interpolação de timestamp — NÃO cria frames novos)
+//  [6] Frame Pacing / Motion Smoothing (interpolação de timestamp — NÃO cria frames novos)
 //      Ajusta o timestamp de apresentação (releaseOutputBuffer timestamp) via
 //      curvas matemáticas (linear, ease-in-out, cubic, exponencial, smooth-step).
 //      Isso afeta QUANDO um frame é exibido, não O QUÊ é exibido. Não há
 //      criação de frames intermediários nem optical-flow — é frame pacing avançado.
 //
-//  [8] Local Upscaling (seleção de modo de scaler do MediaCodec)
+//  [7] Local Upscaling (seleção de modo de scaler do MediaCodec)
 //      Configura o MediaCodec.VIDEO_SCALING_MODE conforme a preferência.
 //      Modo "Lanczos" usa VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING —
 //      o scaler de alta qualidade do hardware Android, não uma implementação
-//      Lanczos própria. Modo HUD força ativação de Block Analysis + HUD Detection.
+//      Lanczos própria.
 //
 // CORREÇÕES DE ARQUITETURA (bugs de estado em runtime):
 //
@@ -165,16 +158,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int PSEUDO_FRAME_ROWS = 8;
     private byte[] lastFrameSample;
     private long lastBitrateAnalysisMs;
-    // FIX-1: AtomicInteger para evitar race condition entre input thread e render/choreographer thread
-    private final AtomicInteger pendingDeduplicationDrops = new AtomicInteger(0);
+    // Contadores separados para cada política de drop — misturá-los num único
+    // AtomicInteger tornava impossível saber qual motivo consumiu qual drop.
+    // FIX-1: AtomicInteger para evitar race condition entre input thread e render/choreographer thread.
+    private final AtomicInteger pendingJumpFrameDrops   = new AtomicInteger(0); // drops agendados pelo Jump-Frame
+    private final AtomicInteger pendingFrameDedupDrops  = new AtomicInteger(0); // drops agendados pela Local Frame Dedup
 
-    // Compressão por regiões iguais + máscara de processamento + detecção de HUD
+    // Compressão por regiões iguais + máscara de processamento
     private BlockCompressionAnalyzer blockCompressionAnalyzer;
-    private HudDetector hudDetector;
     private ProcessingMask processingMask;
     private AdaptiveSharpnessFilter adaptiveSharpnessFilter;
-    private int[] hudRepeatStreakByRegion;
-    private int hudRegionGridSize;
 
     // Deduplicação de áreas (config própria, separada do menu de filtros)
     private AreaDeduplicator areaDeduplicator;
@@ -182,7 +175,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private int pendingAreaReplacementFrames;
     // FIX-3: buffer reutilizável para analyzeBlockCompression — evita new int[] por frame
     private int[] pseudoFrameBuffer;
-    private static final int HUD_REGION_SIZE = 32;
     private static final int DEFAULT_SHARPNESS_BASE = 50;
     private int localSmoothingQueueLimit = 2;
 
@@ -606,7 +598,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             prefs.localFrameDeduplication = false;
             prefs.blockCompressionEnabled = false;
             prefs.areaDeduplicationEnabled = false;
-            prefs.hudDetectionEnabled = false;
             prefs.adaptiveSharpness = false;
             prefs.localMotionSmoothing = false;
             prefs.bitrateOptimization = false;
@@ -744,16 +735,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
             LimeLog.info("Local upscaling enabled: high-quality hardware scaler path (VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)");
         }
-        else if (prefs.localUpscalingMode == 3) {
-            // Modo "Detecção de HUD": usa o scaler de hardware normalmente, mas ativa
-            // (força) a detecção de HUD + compressão por blocos independentemente das
-            // outras preferências, priorizando reduzir custo em áreas de HUD/menu.
-            videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
-            prefs.hudDetectionEnabled = true;
-            prefs.blockCompressionEnabled = true;
-            LimeLog.info("Local upscaling enabled: HUD detection mode (detects repeated non-central regions; note: does not reduce stream resolution on the host)");
-
-        }
         else {
             videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
             LimeLog.info("Local upscaling enabled: bilinear hardware scaler path");
@@ -871,7 +852,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     private void analyzeFrameForLocalOptimizations(byte[] data, int length, int frameType) {
         boolean needsBitrateAnalysis = prefs.bitrateOptimization || prefs.localFrameDeduplication
-                || prefs.blockCompressionEnabled || prefs.hudDetectionEnabled
+                || prefs.blockCompressionEnabled
                 || prefs.areaDeduplicationEnabled;
         if (!needsBitrateAnalysis) {
             return;
@@ -891,8 +872,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (similarity >= prefs.frameSimilarityThreshold && frameType != MoonBridge.FRAME_TYPE_IDR) {
             activeWindowVideoStats.similarFramesDetected++;
             if (prefs.localFrameDeduplication) {
-                // FIX-1: AtomicInteger com cap em 2, thread-safe com o render thread
-                pendingDeduplicationDrops.getAndUpdate(v -> Math.min(v + 1, 2));
+                // FIX-1: AtomicInteger separado para dedup, com cap em 2
+                pendingFrameDedupDrops.getAndUpdate(v -> Math.min(v + 1, 2));
             }
             consecutiveSimilarFrames++;
             consecutiveDissimilarFrames = 0;
@@ -942,10 +923,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         if (prefs.blockCompressionEnabled) {
             analyzeBlockCompression(currentSample);
-        }
-
-        if (prefs.hudDetectionEnabled) {
-            analyzeHudRegions(similarity);
         }
 
         if (prefs.areaDeduplicationEnabled) {
@@ -1086,88 +1063,39 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     /**
-     * Detecção de HUD — análise e cálculo informativo.
-     * Rastreia regiões não-centrais do frame que se repetem entre frames consecutivos
-     * (HUD, minimapa, contador de munição, menus) e calcula um percentual de
-     * "redução de resolução possível" para cada região (hudDetector.computeResolutionReduction).
-     * LIMITAÇÃO: esse valor é informativo. O Android recebe um stream H.264/HEVC/AV1
-     * já codificado pelo PC — não é possível reduzir a resolução de uma região do
-     * stream no cliente sem modificar o encoder remoto (Sunshine/NVENC). A detecção
-     * serve como insumo para futuras integrações com o host ou para o overlay de stats.
+     * Decrementa atomicamente um AtomicInteger sem deixá-lo ficar negativo.
+     * Usa um CAS loop para garantir que o decremento e a verificação sejam
+     * uma operação única — o par getAndDecrement()+incrementAndGet() anterior
+     * não era atômico e permitia que outra thread entrasse entre as duas ops.
+     *
+     * @return true se havia um drop pendente e foi consumido, false caso contrário.
      */
-    private void analyzeHudRegions(int overallSimilarity) {
-        if (hudRepeatStreakByRegion == null || hudRepeatStreakByRegion.length == 0) {
-            return;
-        }
-
-        long startNs = System.nanoTime();
-
-        int regionCols = Math.max(1, (initialWidth + hudRegionGridSize - 1) / hudRegionGridSize);
-        int regionRows = Math.max(1, (initialHeight + hudRegionGridSize - 1) / hudRegionGridSize);
-        int centerColStart = regionCols / 4;
-        int centerColEnd = regionCols - centerColStart;
-        int centerRowStart = regionRows / 4;
-        int centerRowEnd = regionRows - centerRowStart;
-
-        int hudDetected = 0;
-        int hudSkipped = 0;
-
-        for (int ry = 0; ry < regionRows; ry++) {
-            for (int rx = 0; rx < regionCols; rx++) {
-                int idx = ry * regionCols + rx;
-                if (idx >= hudRepeatStreakByRegion.length) {
-                    continue;
-                }
-
-                // "Coisas não centrais": fora da área central da tela são candidatas a HUD.
-                boolean isNonCentral = rx < centerColStart || rx >= centerColEnd
-                        || ry < centerRowStart || ry >= centerRowEnd;
-
-                if (isNonCentral && overallSimilarity >= prefs.frameSimilarityThreshold) {
-                    hudRepeatStreakByRegion[idx] = Math.min(hudRepeatStreakByRegion[idx] + 1, 10);
-                } else {
-                    hudRepeatStreakByRegion[idx] = Math.max(hudRepeatStreakByRegion[idx] - 1, 0);
-                }
-
-                if (hudRepeatStreakByRegion[idx] >= 3) {
-                    // Região repetitiva não-central: calcula redução proporcional ao streak.
-                    int maxReduction = Math.max(0, Math.min(100, prefs.hudResolutionReduction));
-                    int reduction = hudDetector.computeResolutionReduction(hudRepeatStreakByRegion[idx], maxReduction);
-                    // Conecta o resultado ao area dedup: se a redução calculada for >= 50%,
-                    // essa região está suficientemente estática para pular o próximo frame
-                    // que a contenha. Incrementa pendingAreaReplacementFrames para sinalizar
-                    // ao submitDecodeUnit que o próximo frame pode ser descartado antes do decode.
-                    if (prefs.areaDeduplicationEnabled && reduction >= 50
-                            && pendingAreaReplacementFrames == 0) {
-                        pendingAreaReplacementFrames = 1;
-                    }
-                    hudDetected++;
-                } else {
-                    hudSkipped++;
-                }
+    private boolean consumeDropIfPending(AtomicInteger counter) {
+        int current;
+        do {
+            current = counter.get();
+            if (current <= 0) {
+                return false;
             }
-        }
-
-        activeWindowVideoStats.hudElementsDetected += hudDetected;
-        activeWindowVideoStats.hudRegionsSkipped += hudSkipped;
-        activeWindowVideoStats.hudDetectionTimeMs += (System.nanoTime() - startNs) / 1000000L;
+        } while (!counter.compareAndSet(current, current - 1));
+        return true;
     }
 
     private boolean shouldDropOutputFrame(long presentationTimeUs) {
-        // FIX-1: getAndDecrement atômico — elimina a race condition entre get() e decrementAndGet()
-        // que existia quando o Choreographer e o rendererThread chamavam este método concorrentemente.
-        // Se o valor lido pelo getAndDecrement já era <= 0, revertemos o decremento imediatamente.
-        int drops = pendingDeduplicationDrops.getAndDecrement();
-        if (drops > 0) {
-            activeWindowVideoStats.framesDroppedByLocalDeduplication++;
+        // Jump-Frame tem prioridade: consome primeiro do seu próprio contador.
+        if (consumeDropIfPending(pendingJumpFrameDrops)) {
+            // framesDroppedByJumpFrame já foi incrementado no momento do agendamento
             return true;
-        } else {
-            // Não havia drops pendentes; desfaz o decremento que acabamos de fazer
-            pendingDeduplicationDrops.incrementAndGet();
         }
 
-        // Nota: area deduplication agora é tratada ANTES da decodificação em
-        // submitDecodeUnit(), então não há mais contagem aqui para esse caso.
+        // Local Frame Dedup: contador separado, política independente.
+        if (consumeDropIfPending(pendingFrameDedupDrops)) {
+            activeWindowVideoStats.framesDroppedByLocalDeduplication++;
+            return true;
+        }
+
+        // Nota: area deduplication é tratada ANTES da decodificação em
+        // submitDecodeUnit(), então não há contagem aqui para esse caso.
 
         if (prefs.preferAudioOverVideo && prefs.targetLatencyMs > 0) {
             long frameAgeMs = SystemClock.uptimeMillis() - (presentationTimeUs / 1000);
@@ -1520,12 +1448,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 PSEUDO_FRAME_COLS, PSEUDO_FRAME_ROWS, effectiveBlockSize);
         this.adaptiveSharpnessFilter = new AdaptiveSharpnessFilter(DEFAULT_SHARPNESS_BASE);
 
-        this.hudDetector = new HudDetector(width, height);
-        this.hudRegionGridSize = HUD_REGION_SIZE;
-        int regionCols = Math.max(1, (width + hudRegionGridSize - 1) / hudRegionGridSize);
-        int regionRows = Math.max(1, (height + hudRegionGridSize - 1) / hudRegionGridSize);
-        this.hudRepeatStreakByRegion = new int[regionCols * regionRows];
-
         // Deduplicação de áreas (config própria, independente do menu de filtros)
         int areaGridSize = prefs.areaDedupGridSize > 0 ? prefs.areaDedupGridSize : 8;
         this.areaDeduplicator = new AreaDeduplicator(areaGridSize);
@@ -1536,7 +1458,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.pseudoFrameBuffer = new int[FRAME_SAMPLE_SIZE];
 
         // FIX-2: garante estado limpo ao inicializar (também cobre reinicializações via recovery)
-        this.pendingDeduplicationDrops.set(0);
+        this.pendingJumpFrameDrops.set(0);
+        this.pendingFrameDedupDrops.set(0);
         this.lastFrameSample = null;
         this.lastBitrateAnalysisMs = 0;
 
@@ -1582,7 +1505,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 // durante o recovery, os primeiros frames válidos pós-IDR seriam descartados,
                 // impedindo o decoder de receber dados e fazendo todas as 10 tentativas
                 // de recovery falharem em cascata — o que gera o "Decodificador Falhou".
-                pendingDeduplicationDrops.set(0);
+                pendingJumpFrameDrops.set(0);
+                pendingFrameDedupDrops.set(0);
                 pendingAreaReplacementFrames = 0;
                 lastFrameSample = null;          // força nova baseline de comparação pós-recovery
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
@@ -2307,7 +2231,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             if (frameType != MoonBridge.FRAME_TYPE_IDR &&
                 jumpFrameCounter <= framesToSkip &&
                 jumpFrameCounter < JUMPFRAME_COUNTER_INTERVAL) {
-                pendingDeduplicationDrops.getAndUpdate(v -> Math.min(v + 1, 3));
+                pendingJumpFrameDrops.getAndUpdate(v -> Math.min(v + 1, 3));
                 activeWindowVideoStats.framesDroppedByJumpFrame++;
             }
 

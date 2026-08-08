@@ -93,8 +93,7 @@ public class PreferenceConfiguration {
     private static final String BLOCK_COMPRESSION_PREF_STRING = "checkbox_block_compression";
     private static final String BLOCK_SIZE_PREF_STRING = "list_block_size";
     private static final String ADAPTIVE_SHARPNESS_PREF_STRING = "checkbox_adaptive_sharpness";
-    private static final String HUD_DETECTION_PREF_STRING = "checkbox_hud_detection";
-    private static final String HUD_RESOLUTION_REDUCTION_PREF_STRING = "seekbar_hud_resolution_reduction";
+
 
     // Deduplicação de áreas (config própria, separada do menu de filtros)
     private static final String AREA_DEDUPLICATION_PREF_STRING = "checkbox_area_deduplication";
@@ -183,8 +182,7 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_BLOCK_COMPRESSION = false;
     private static final int DEFAULT_BLOCK_SIZE = 16;
     private static final boolean DEFAULT_ADAPTIVE_SHARPNESS = false;
-    private static final boolean DEFAULT_HUD_DETECTION = false;
-    private static final int DEFAULT_HUD_RESOLUTION_REDUCTION = 50;
+
 
     // Deduplicação de áreas: desligada por padrão (feature opcional/experimental)
     private static final boolean DEFAULT_AREA_DEDUPLICATION = false;
@@ -267,8 +265,7 @@ public class PreferenceConfiguration {
     public boolean blockCompressionEnabled;
     public int blockSize;
     public boolean adaptiveSharpness;
-    public boolean hudDetectionEnabled;
-    public int hudResolutionReduction;
+
 
     // Deduplicação de áreas (config própria, separada do menu de filtros).
     // Cada var abaixo só faz sentido/é habilitada na UI quando areaDeduplicationEnabled = true.
@@ -749,8 +746,7 @@ public class PreferenceConfiguration {
         config.blockCompressionEnabled = prefs.getBoolean(BLOCK_COMPRESSION_PREF_STRING, DEFAULT_BLOCK_COMPRESSION);
         config.blockSize = Integer.parseInt(prefs.getString(BLOCK_SIZE_PREF_STRING, String.valueOf(DEFAULT_BLOCK_SIZE)));
         config.adaptiveSharpness = prefs.getBoolean(ADAPTIVE_SHARPNESS_PREF_STRING, DEFAULT_ADAPTIVE_SHARPNESS);
-        config.hudDetectionEnabled = prefs.getBoolean(HUD_DETECTION_PREF_STRING, DEFAULT_HUD_DETECTION);
-        config.hudResolutionReduction = prefs.getInt(HUD_RESOLUTION_REDUCTION_PREF_STRING, DEFAULT_HUD_RESOLUTION_REDUCTION);
+
 
         // Deduplicação de áreas
         config.areaDeduplicationEnabled = prefs.getBoolean(AREA_DEDUPLICATION_PREF_STRING, DEFAULT_AREA_DEDUPLICATION);

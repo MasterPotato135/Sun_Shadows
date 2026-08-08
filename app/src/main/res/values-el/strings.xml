@@ -275,7 +275,6 @@
 
 <string name="local_upscaling_bilinear">Bilinear</string>
 <string name="local_upscaling_lanczos">Lanczos</string>
-<string name="local_upscaling_hud_detection">Ανίχνευση HUD</string>
 
 <string name="title_checkbox_prefer_audio_over_video">Προτίμηση ήχου έναντι βίντεο</string>
 <string name="summary_checkbox_prefer_audio_over_video">Διατηρεί συνεχή ήχο θυσιάζοντας ομαλότητα βίντεο όταν χρειάζεται</string>

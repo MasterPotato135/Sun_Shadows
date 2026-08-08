@@ -358,7 +358,6 @@
 
 <string name="local_upscaling_bilinear">Bilinear</string>
 <string name="local_upscaling_lanczos">Lanczos</string>
-<string name="local_upscaling_hud_detection">HUD-Erkennung</string>
 
 <string name="title_checkbox_prefer_audio_over_video">Audio gegenüber Video bevorzugen</string>
 <string name="summary_checkbox_prefer_audio_over_video">Hält Audio kontinuierlich und reduziert Unterbrechungen durch Verringerung der Videoflüssigkeit bei Bedarf</string>

@@ -345,7 +345,7 @@
     <string name="summary_list_local_upscaling_mode">Selects the local scaling filter used by the device</string>
     <string name="local_upscaling_bilinear">Bilinear</string>
     <string name="local_upscaling_lanczos">Lanczos</string>
-    <string name="local_upscaling_hud_detection">HUD Detection</string>
+
     <string name="title_checkbox_prefer_audio_over_video">Prefer audio over video</string>
     <string name="summary_checkbox_prefer_audio_over_video">Keeps audio continuous and reduces interruptions by sacrificing some video smoothness when needed</string>
     <string name="title_list_transition_frame_mode">Transition frames</string>

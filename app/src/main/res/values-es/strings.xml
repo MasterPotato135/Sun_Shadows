@@ -352,7 +352,6 @@
 
 <string name="local_upscaling_bilinear">Bilineal</string>
 <string name="local_upscaling_lanczos">Lanczos</string>
-<string name="local_upscaling_hud_detection">Detección de HUD</string>
 
 
 <string name="title_checkbox_prefer_audio_over_video">Priorizar audio sobre vídeo</string>

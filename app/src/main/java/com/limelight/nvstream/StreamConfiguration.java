@@ -67,12 +67,10 @@ public class StreamConfiguration {
     private int minBitrateFor4G = 2000;  // 2Mbps mínimo
     private int maxBitrateFor4G = 8000;  // 8Mbps máximo
     
-    // Block compression + Adaptive processing + HUD detection
+    // Block compression + Adaptive processing
     private boolean blockCompressionEnabled = true;
     private int blockSize = 16;  // 8 ou 16 pixels
     private boolean adaptiveSharpness = true;
-    private boolean hudDetectionEnabled = true;
-    private int hudResolutionReduction = 50;  // 0-100% redução
 
     public static class Builder {
         private StreamConfiguration config = new StreamConfiguration();
@@ -182,16 +180,6 @@ public class StreamConfiguration {
         
         public StreamConfiguration.Builder setAdaptiveSharpnessEnabled(boolean enable) {
             config.adaptiveSharpness = enable;
-            return this;
-        }
-        
-        public StreamConfiguration.Builder setHudDetectionEnabled(boolean enable) {
-            config.hudDetectionEnabled = enable;
-            return this;
-        }
-        
-        public StreamConfiguration.Builder setHudResolutionReduction(int reduction) {
-            config.hudResolutionReduction = reduction;  // 0-100
             return this;
         }
         
@@ -514,14 +502,6 @@ public class StreamConfiguration {
     
     public boolean isAdaptiveSharpnessEnabled() {
         return adaptiveSharpness;
-    }
-    
-    public boolean isHudDetectionEnabled() {
-        return hudDetectionEnabled;
-    }
-    
-    public int getHudResolutionReduction() {
-        return hudResolutionReduction;
     }
     
     // Dynamic bitrate adjustment method

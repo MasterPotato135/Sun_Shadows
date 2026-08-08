@@ -138,12 +138,10 @@
     <string-array name="local_upscaling_names">
         <item>@string/local_upscaling_bilinear</item>
         <item>@string/local_upscaling_lanczos</item>
-        <item>@string/local_upscaling_hud_detection</item>
     </string-array>
     <string-array name="local_upscaling_values" translatable="false">
         <item>1</item>
         <item>2</item>
-        <item>3</item>
     </string-array>
 
     <string-array name="transition_frame_names">

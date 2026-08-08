@@ -23,7 +23,6 @@
     <string name="local_upscaling_disabled">Desligado</string>
     <string name="local_upscaling_bilinear">Bilinear</string>
     <string name="local_upscaling_lanczos">Lanczos</string>
-    <string name="local_upscaling_hud_detection">Detecção de HUD</string>
     <string name="transition_frame_off">Desligado</string>
     <string name="transition_frame_weak">Fraco (25%)</string>
     <string name="transition_frame_medium">Médio (50%)</string>
