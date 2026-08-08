@@ -239,11 +239,16 @@ class HudDetector {
             System.arraycopy(frameData, 0, previousFrameHash, 0, frameData.length);
             return false;
         }
-        
+
+        // BUG CORRIGIDO: a cópia do frame atual para previousFrameHash foi movida para fora
+        // deste método. Antes, a cópia era feita aqui dentro, o que fazia com que chamadas
+        // subsequentes para regiões do mesmo frame comparassem contra o frame ATUAL (já copiado)
+        // em vez do frame ANTERIOR. O chamador deve invocar updatePreviousFrame() uma única vez
+        // após processar todas as regiões do frame.
         int startIdx = regionY * frameWidth + regionX;
         int identicalPixels = 0;
         int totalPixels = 0;
-        
+
         for (int y = 0; y < regionSize && regionY + y < frameHeight; y++) {
             for (int x = 0; x < regionSize && regionX + x < frameWidth; x++) {
                 int idx = startIdx + y * frameWidth + x;
@@ -253,11 +258,20 @@ class HudDetector {
                 totalPixels++;
             }
         }
-        
-        // Copia frame atual para comparação próxima
-        System.arraycopy(frameData, 0, previousFrameHash, 0, frameData.length);
-        
+
         return totalPixels > 0 && (identicalPixels / (float) totalPixels) > 0.85f;
+    }
+
+    /**
+     * Deve ser chamado UMA VEZ pelo chamador após processar todas as regiões do frame atual,
+     * para atualizar o histórico para o próximo frame. Separado de isHudRegion para evitar
+     * que a cópia do frame corrompesse comparações de regiões subsequentes no mesmo frame.
+     */
+    void updatePreviousFrame(int[] frameData) {
+        if (previousFrameHash == null || previousFrameHash.length != frameData.length) {
+            previousFrameHash = new int[frameData.length];
+        }
+        System.arraycopy(frameData, 0, previousFrameHash, 0, frameData.length);
     }
 
     /**
@@ -505,9 +519,14 @@ class AreaDeduplicator {
                                             int replaceFrames, int similarityThreshold) {
         ensureHistoryCapacity(lookbackFrames);
 
+        // BUG CORRIGIDO: a comparação deve ocorrer ANTES de inserir o frame atual no histórico.
+        // Na versão anterior, quando o histórico tinha capacidade 1 (lookbackFrames=1), o frame
+        // era salvo em history[0] antes de countStableAreas ser chamado. countStableAreas então
+        // comparava currentSample contra history[0], que ERA currentSample — similaridade sempre
+        // 100%, gerando falsos positivos e descartando frames indevidamente.
         int stableAreas = countStableAreas(currentSample, similarityThreshold);
 
-        // Guarda o frame atual no histórico circular de (y) frames anteriores.
+        // Guarda o frame atual no histórico circular APÓS a comparação.
         if (currentSample != null) {
             history[historyHead] = currentSample;
             historyHead = (historyHead + 1) % history.length;

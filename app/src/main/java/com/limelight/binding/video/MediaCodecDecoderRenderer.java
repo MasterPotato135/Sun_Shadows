@@ -845,12 +845,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 bitrateReduced = true;
                 LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene, " + consecutiveSimilarFrames + " similar frames)");
             } else if (bitrateReduced && consecutiveDissimilarFrames >= BITRATE_RESTORE_THRESHOLD) {
-                // Cena mudou: restaura bitrate original
+                // Cena mudou: restaura bitrate original.
+                // Zera AMBOS os contadores: similar para evitar re-redução imediata no próximo
+                // ciclo, e dissimilar para que a janela de restauração comece do zero após o reset.
                 updateDynamicBitrate(prefs.bitrate);
                 currentDynamicBitrate = prefs.bitrate;
                 bitrateReduced = false;
                 consecutiveSimilarFrames = 0;
-                LimeLog.info("Bitrate restored to " + prefs.bitrate + " kbps (scene changed, " + consecutiveDissimilarFrames + " dissimilar frames)");
+                consecutiveDissimilarFrames = 0;
+                LimeLog.info("Bitrate restored to " + prefs.bitrate + " kbps (scene changed)");
             }
         }
 
@@ -1064,11 +1067,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     private boolean shouldDropOutputFrame(long presentationTimeUs) {
-        // FIX-1: decrementAndGet atômico — seguro para ser chamado do Choreographer e rendererThread
-        if (pendingDeduplicationDrops.get() > 0) {
-            pendingDeduplicationDrops.decrementAndGet();
+        // FIX-1: getAndDecrement atômico — elimina a race condition entre get() e decrementAndGet()
+        // que existia quando o Choreographer e o rendererThread chamavam este método concorrentemente.
+        // Se o valor lido pelo getAndDecrement já era <= 0, revertemos o decremento imediatamente.
+        int drops = pendingDeduplicationDrops.getAndDecrement();
+        if (drops > 0) {
             activeWindowVideoStats.framesDroppedByLocalDeduplication++;
             return true;
+        } else {
+            // Não havia drops pendentes; desfaz o decremento que acabamos de fazer
+            pendingDeduplicationDrops.incrementAndGet();
         }
 
         // Nota: area deduplication agora é tratada ANTES da decodificação em
@@ -1411,8 +1419,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private void initLocalFrameOptimizationState(int width, int height) {
         int blockSize = prefs.blockSize > 0 ? prefs.blockSize : 16;
 
-        this.blockCompressionAnalyzer = new BlockCompressionAnalyzer(blockSize, FRAME_SAMPLE_SIZE, 1);
-        this.processingMask = new ProcessingMask(FRAME_SAMPLE_SIZE, 1, Math.max(1, blockSize / 4));
+        // BUG CORRIGIDO: antes, o BlockCompressionAnalyzer usava `blockSize` (ex: 16) enquanto
+        // a ProcessingMask dividia o espaço usando `blockSize/4` (ex: 4). Isso fazia o loop em
+        // analyzeBlockCompression iterar FRAME_SAMPLE_SIZE/(blockSize/4) blocos (ex: 32), mas o
+        // analyzer calculava startX = blockX * 16, alcançando índices fora do array para blockX
+        // grande, ou cobrindo regiões sobrepostas e não alinhadas com a máscara.
+        // Correção: ambos usam o mesmo blockSize efetivo (blockSize/4), mantendo coerência entre
+        // o número de colunas da máscara e o tamanho de bloco do analyzer.
+        int effectiveBlockSize = Math.max(1, blockSize / 4);
+        this.blockCompressionAnalyzer = new BlockCompressionAnalyzer(effectiveBlockSize, FRAME_SAMPLE_SIZE, 1);
+        this.processingMask = new ProcessingMask(FRAME_SAMPLE_SIZE, 1, effectiveBlockSize);
         this.adaptiveSharpnessFilter = new AdaptiveSharpnessFilter(DEFAULT_SHARPNESS_BASE);
 
         this.hudDetector = new HudDetector(width, height);
