@@ -9,20 +9,21 @@
 // mas NÃO reduzem a quantidade de dados transmitidos pela rede. Para reduzir banda
 // de fato, é necessário alterar o encoder remoto (Sunshine/NVENC) via control stream.
 //
-//  [1] Jump-frame (contagem estatística — NÃO reduz banda de rede)
-//      Conta, a cada 5 frames, quantos seriam "pulados" conforme o modo
-//      configurado (light/medium/heavy). A submissão ao decoder NÃO é
-//      suprimida: quadros P dependem de anteriores e suprimi-los causava
-//      corrupção + crash. Os frames já chegaram pela rede quando essa
-//      contagem ocorre — apenas a estatística é registrada no overlay.
+//  [1] Jump-frame (drop de frames na SAÍDA do decoder — NÃO reduz banda de rede)
+//      A cada 5 frames (JUMPFRAME_COUNTER_INTERVAL), incrementa pendingDeduplicationDrops
+//      conforme o modo (light=1, medium=2, heavy=3 drops por janela). Os frames
+//      são decodificados normalmente; shouldDropOutputFrame() suprime a apresentação
+//      na surface antes de releaseOutputBuffer. Quadros P não são suprimidos na
+//      entrada (evita corrupção de GOP). Bytes já chegaram pela rede — benefício
 //
 //  [2] Local Frame Deduplication (economiza GPU/display, NÃO banda de rede)
-//      Coleta uma amostra de 48 bytes do bitstream comprimido e compara
-//      com o frame anterior. Frames com similaridade acima do limiar são
-//      descartados NA SAÍDA do decoder (shouldDropOutputFrame), evitando
-//      que a GPU processe e exiba um frame idêntico ao anterior. Nota:
-//      bytes do bitstream comprimido ≠ pixels — a amostra é uma heurística,
-//      não uma comparação perceptual real.
+//      Coleta uma amostra de 128 bytes distribuídos pelo bitstream comprimido
+//      e compara com o frame anterior usando tolerância de ±4 por byte de
+//      payload (getEncodedFrameSimilarity). Frames com similaridade acima do
+//      limiar são descartados NA SAÍDA do decoder (shouldDropOutputFrame),
+//      evitando que a GPU processe e exiba um frame visualmente idêntico.
+//      Nota: bytes de bitstream comprimido ≠ pixels — heurística, não
+//      comparação perceptual real; amostras maiores reduzem falsos positivos.
 //
 //  [3] Block Analysis (análise de blocos do bitstream — NÃO compressão de vídeo)
 //      Interpreta os 48 bytes da amostra do frame como intensidades de
@@ -82,9 +83,11 @@
 //
 //  [FIX-3] pseudoFrameBuffer reutilizável (sem alocação por frame)
 //      analyzeBlockCompression criava new int[FRAME_SAMPLE_SIZE] a cada
-//      chamada (~60x/s). Isso gerava pressão constante de GC no momento
-//      exato em que o MediaCodec precisa de buffers de entrada — pausas de
-//      GC faziam o decoder perder o prazo e lançar CodecException transiente.
+//      chamada (~60x/s), gerando alocações frequentes no caminho quente do
+//      decoder. Alocações frequentes aumentam a pressão sobre o GC; pausas
+//      de GC no thread de entrada do MediaCodec podem contribuir para que o
+//      decoder perca prazos de entrega de buffer (a relação causal exata
+//      depende do dispositivo e não foi medida com profiler neste projeto).
 //      Agora o buffer é alocado uma vez em initLocalFrameOptimizationState
 //      e reutilizado em todas as chamadas subsequentes.
 //
@@ -136,6 +139,7 @@ import android.media.MediaFormat;
 import android.media.MediaCodec.BufferInfo;
 import android.media.MediaCodec.CodecException;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Process;
@@ -153,7 +157,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int JUMPFRAME_COUNTER_INTERVAL = 5;
     private int jumpFrameCounter = 0;
     private int jumpFrameMode = StreamConfiguration.JUMPFRAME_MODE_OFF;
-    private static final int FRAME_SAMPLE_SIZE = 48;
+    private static final int FRAME_SAMPLE_SIZE = 128;
     private byte[] lastFrameSample;
     private long lastBitrateAnalysisMs;
     // FIX-1: AtomicInteger para evitar race condition entre input thread e render/choreographer thread
@@ -762,19 +766,38 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return sample;
     }
 
+    // Tolerância de ±4 para bytes de payload comprimido: variações pequenas de
+    // quantização entre frames visualmente idênticos não devem ser penalizadas.
+    // Bytes de cabeçalho NAL (primeiros 8) são comparados com igualdade exata
+    // pois diferenças neles indicam mudança de tipo/slice, não de conteúdo visual.
+    private static final int SIMILARITY_BYTE_TOLERANCE = 4;
+    private static final int SIMILARITY_HEADER_BYTES = 8;
+
     private int getEncodedFrameSimilarity(byte[] a, byte[] b) {
         if (a == null || b == null || a.length != b.length) {
             return 0;
         }
 
-        int matching = 0;
+        int score = 0;
+        int maxScore = a.length * 2; // cada byte vale até 2 pontos
+
         for (int i = 0; i < a.length; i++) {
-            if (a[i] == b[i]) {
-                matching++;
+            int diff = Math.abs((a[i] & 0xFF) - (b[i] & 0xFF));
+            if (i < SIMILARITY_HEADER_BYTES) {
+                // Cabeçalho NAL: exige igualdade exata; divergência pesa mais
+                if (diff == 0) score += 2;
+            } else {
+                // Payload: tolerância de ±TOLERANCE conta como similar
+                if (diff == 0) {
+                    score += 2;
+                } else if (diff <= SIMILARITY_BYTE_TOLERANCE) {
+                    score += 1;
+                }
+                // diff > TOLERANCE: 0 pontos
             }
         }
 
-        return (matching * 100) / a.length;
+        return (score * 100) / maxScore;
     }
 
     private void analyzeFrameForLocalOptimizations(byte[] data, int length, int frameType) {

@@ -429,7 +429,7 @@ public class NvConnection {
                             context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
                             context.serverCodecModeSupport,
                             context.negotiatedWidth, context.negotiatedHeight,
-                            context.streamConfig.getRefreshRate(), context.streamConfig.getBitrate(),
+                            context.streamConfig.getRefreshRate(), context.streamConfig.getDynamicBitrate(),
                             context.negotiatedPacketSize, context.negotiatedRemoteStreaming,
                             context.streamConfig.getAudioConfiguration().toInt(),
                             context.streamConfig.getSupportedVideoFormats(),
