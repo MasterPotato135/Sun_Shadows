@@ -82,7 +82,7 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix ".debug"
-            resValue "string", "app_label", "Sun Shadows (Beta)"
+            resValue "string", "app_label", "Sun Shadows"
             resValue "string", "app_label_root", "Moonlight (Root Debug)"
 
             minifyEnabled true

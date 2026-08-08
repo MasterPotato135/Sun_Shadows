@@ -176,10 +176,14 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_LOCAL_MOTION_SMOOTHING = false;
     private static final boolean DEFAULT_AUTO_RECONNECT = true;
     private static final int DEFAULT_AUTO_RECONNECT_ATTEMPTS = 3;
-    private static final boolean DEFAULT_BLOCK_COMPRESSION = true;
+    // Desligados por padrão: essas análises consomem CPU em cada frame (~60x/s) e
+    // a relação custo/benefício depende do dispositivo. O usuário pode ativá-las
+    // manualmente em Configurações → Filtros de Vídeo após avaliar o impacto.
+    // Ligá-las por padrão contradizia o objetivo do fork (melhorar desempenho em 4G).
+    private static final boolean DEFAULT_BLOCK_COMPRESSION = false;
     private static final int DEFAULT_BLOCK_SIZE = 16;
-    private static final boolean DEFAULT_ADAPTIVE_SHARPNESS = true;
-    private static final boolean DEFAULT_HUD_DETECTION = true;
+    private static final boolean DEFAULT_ADAPTIVE_SHARPNESS = false;
+    private static final boolean DEFAULT_HUD_DETECTION = false;
     private static final int DEFAULT_HUD_RESOLUTION_REDUCTION = 50;
 
     // Deduplicação de áreas: desligada por padrão (feature opcional/experimental)
@@ -188,7 +192,7 @@ public class PreferenceConfiguration {
     private static final int DEFAULT_AREA_DEDUP_CHECK_INTERVAL = 10;
     // (y) quantos frames anteriores são olhados para tentar achar um padrão local
     private static final int DEFAULT_AREA_DEDUP_LOOKBACK_FRAMES = 5;
-    // (z) quantos dos próximos frames são substituídos pela imagem genérica de movimento
+    // (z) quantos dos próximos frames são descartados antes do decoder (último frame fica na tela)
     private static final int DEFAULT_AREA_DEDUP_REPLACE_FRAMES = 3;
     private static final int DEFAULT_AREA_DEDUP_SIMILARITY_THRESHOLD = 90;
     private static final int DEFAULT_AREA_DEDUP_GRID_SIZE = 8;

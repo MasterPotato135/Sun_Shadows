@@ -417,4 +417,10 @@ public class MoonBridge {
     public static native boolean guessControllerHasShareButton(int vendorId, int productId);
 
     public static native void init();
+
+    // Solicita ao host encoder (Sunshine/NVENC) que ajuste o bitrate de saída
+    // via mensagem de controle no control stream (RTSP). Esta é a única rota que
+    // reduz efetivamente os bytes transmitidos pela rede — drop de frames no cliente
+    // NÃO economiza banda porque os bytes já foram recebidos.
+    public static native void requestBitrateChange(int newBitrateKbps);
 }

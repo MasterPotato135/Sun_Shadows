@@ -396,17 +396,22 @@ class AdaptiveSharpnessFilter {
 
 /**
  * // main/java/com/limelight/binding/video/VideoStats.java
- * Deduplicador de áreas.
+ * Deduplicador de áreas — descarte pré-decoder baseado em amostras do bitstream.
  *
  * Como funciona:
- * A cada (x) frames [checkInterval], olha para os (y) frames anteriores [lookbackFrames]
- * armazenados em um histórico circular e tenta detectar se existe um padrão local
- * (uma área da amostra do frame que se repete de forma praticamente idêntica ao longo
- * dessa janela). Se um padrão for encontrado, os próximos (z) frames [replaceFrames]
- * passam a ser tratados como "genéricos": ao invés de serem processados/renderizados
- * normalmente, eles reaproveitam a última imagem conhecida (que já reflete o movimento
- * recente das áreas vizinhas), economizando processamento/decodificação enquanto a área
- * permanecer estável.
+ * A cada (x) frames [checkInterval], compara a amostra de 48 bytes do frame atual
+ * com as amostras dos (y) frames anteriores [lookbackFrames] armazenados em histórico
+ * circular. Se pelo menos metade das sub-regiões da grade permanecerem estáveis
+ * (similaridade de bytes acima do limiar) durante toda a janela, sinaliza que os
+ * próximos (z) frames [replaceFrames] devem ser descartados ANTES de entrar no decoder
+ * (via queueInputBuffer com size=0 em submitDecodeUnit).
+ *
+ * IMPORTANTE — o que realmente acontece ao descartar um frame:
+ *   - O frame NÃO é decodificado → economia de CPU do decoder.
+ *   - A superfície de vídeo continua exibindo o último frame decodificado (freeze local).
+ *   - NÃO há substituição por "imagem genérica" ou síntese de conteúdo.
+ *   - Os bytes do frame já foram recebidos pela rede → sem economia de banda.
+ *   - A amostra compara bytes do bitstream comprimido, não pixels — é uma heurística.
  *
  * Esta é uma configuração independente do menu de filtros: cada variável (x, y, z,
  * limiar de similaridade e tamanho da grade de áreas) só é exposta/habilitada quando a
@@ -491,11 +496,14 @@ class AreaDeduplicator {
 
     /**
      * Executa a análise de padrão local (chamada a cada x frames) e, em caso de padrão
-     * encontrado, retorna quantos frames devem ser substituídos pela imagem genérica.
+     * encontrado, retorna quantos frames devem ser descartados antes do decoder.
+     * O chamador (submitDecodeUnit) usa esse valor para chamar queueInputBuffer(size=0),
+     * que devolve o slot de input sem submeter dados — o decoder não decodifica o frame
+     * e a última imagem renderizada permanece na superfície (freeze local).
      *
-     * @param currentSample     amostra do frame atual
-     * @param lookbackFrames    (y) quantos frames anteriores considerar
-     * @param replaceFrames     (z) quantos frames substituir quando um padrão for achado
+     * @param currentSample       amostra de 48 bytes do bitstream comprimido do frame atual
+     * @param lookbackFrames      (y) quantos frames anteriores considerar na janela
+     * @param replaceFrames       (z) quantos frames descartar pré-decoder quando padrão achado
      * @param similarityThreshold limiar (%) de similaridade por área para considerá-la estável
      * @return (z) se um padrão local foi detectado, ou 0 caso contrário
      */

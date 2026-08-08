@@ -3,43 +3,66 @@
 // Path: main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
 // =============================================================================
 //
-// OTIMIZAÇÕES CUSTOMIZADAS (4G / TAILSCALE P2P / LOCAL):
+// OTIMIZAÇÕES CUSTOMIZADAS (4G / TAILSCALE P2P / LOCAL)
+// NOTA IMPORTANTE: A maioria das otimizações abaixo atua APÓS os bytes do frame
+// terem sido recebidos pela rede. Elas economizam CPU/GPU/renderização no cliente,
+// mas NÃO reduzem a quantidade de dados transmitidos pela rede. Para reduzir banda
+// de fato, é necessário alterar o encoder remoto (Sunshine/NVENC) via control stream.
 //
-//  [1] Jump-frame (estatístico)
-//      Contabiliza frames que seriam pulados em redes ruins. A submissão ao
-//      decoder NÃO é mais suprimida aqui — quadros P dependem de anteriores
-//      e suprimi-los causava corrupção + crash (bug corrigido).
+//  [1] Jump-frame (contagem estatística — NÃO reduz banda de rede)
+//      Conta, a cada 5 frames, quantos seriam "pulados" conforme o modo
+//      configurado (light/medium/heavy). A submissão ao decoder NÃO é
+//      suprimida: quadros P dependem de anteriores e suprimi-los causava
+//      corrupção + crash. Os frames já chegaram pela rede quando essa
+//      contagem ocorre — apenas a estatística é registrada no overlay.
 //
-//  [2] Local Frame Deduplication
-//      Compara amostras de frames consecutivos; frames muito similares são
-//      descartados na saída (shouldDropOutputFrame) para economizar GPU/display.
+//  [2] Local Frame Deduplication (economiza GPU/display, NÃO banda de rede)
+//      Coleta uma amostra de 48 bytes do bitstream comprimido e compara
+//      com o frame anterior. Frames com similaridade acima do limiar são
+//      descartados NA SAÍDA do decoder (shouldDropOutputFrame), evitando
+//      que a GPU processe e exiba um frame idêntico ao anterior. Nota:
+//      bytes do bitstream comprimido ≠ pixels — a amostra é uma heurística,
+//      não uma comparação perceptual real.
 //
-//  [3] Block Compression Analysis
-//      Divide a amostra do frame em blocos e detecta regiões uniformes
-//      (mesma cor). Regiões uniformes recebem processamento mínimo; regiões
-//      com detalhe recebem filtro adaptativo de nitidez.
+//  [3] Block Analysis (análise de blocos do bitstream — NÃO compressão de vídeo)
+//      Interpreta os 48 bytes da amostra do frame como intensidades de
+//      cinza e os divide em blocos para identificar regiões "uniformes"
+//      (poucos detalhes). O resultado alimenta a ProcessingMask usada pelo
+//      AdaptiveSharpnessFilter. Não há compressão nem modificação do stream
+//      transmitido — o frame original segue inalterado para o decoder.
 //
-//  [4] HUD Detection
-//      Rastreia regiões não-centrais que se repetem (HUD, minimapa, munição).
-//      Calcula redução de resolução proporcional à repetição.
+//  [4] HUD Detection (detecção e cálculo — sem redução efetiva de resolução no stream)
+//      Rastreia regiões não-centrais que repetem entre frames (HUD, minimapa,
+//      munição) e calcula um percentual de "redução de resolução possível".
+//      Esse valor é informativo: o Android recebe um stream H.264/HEVC já
+//      codificado pelo PC — não é possível alterar a resolução de uma região
+//      do stream recebido sem modificar o encoder remoto.
 //
-//  [5] Area Deduplication
-//      A cada N frames, analisa lookback e detecta padrões repetitivos em
-//      sub-regiões. Frames marcados são descartados ANTES de entrar no
-//      decoder (submitDecodeUnit), economizando CPU de decodificação.
+//  [5] Area Deduplication (descarte pré-decoder — economiza CPU de decodificação)
+//      A cada N frames (areaDedupCheckInterval), analisa os últimos Y frames
+//      e detecta sub-regiões estáveis (mesma amostra de bytes). Quando um
+//      padrão é encontrado, os próximos Z frames são descartados ANTES de
+//      entrar no decoder via queueInputBuffer(size=0), economizando CPU de
+//      decodificação. Não economiza banda de rede (bytes já recebidos).
 //
-//  [6] Adaptive Sharpness Filter
-//      Aplica nitidez seletiva por bloco — mais forte onde há detalhe,
-//      zero em áreas lisas — usando ProcessingMask.
+//  [6] Adaptive Sharpness (cálculo de intensidade por bloco — sem pipeline de vídeo)
+//      Usa a ProcessingMask do Block Analysis para calcular a intensidade de
+//      nitidez por bloco (0 em regiões uniformes, baseSharpness+20 em regiões
+//      com detalhe). O valor calculado é retornado por getSharpnessForBlock()
+//      mas não é aplicado por um pipeline de pós-processamento de vídeo —
+//      aguarda integração futura com filtros de superfície/shader.
 //
-//  [7] Transition / Motion Smoothing
-//      Interpola o timestamp de renderização para suavizar transições.
-//      Suporta múltiplas curvas: linear, ease-in-out, cubic, exponencial,
-//      smooth-step. A força e frequência são configuráveis por preferência.
+//  [7] Frame Pacing / Motion Smoothing (interpolação de timestamp — NÃO cria frames novos)
+//      Ajusta o timestamp de apresentação (releaseOutputBuffer timestamp) via
+//      curvas matemáticas (linear, ease-in-out, cubic, exponencial, smooth-step).
+//      Isso afeta QUANDO um frame é exibido, não O QUÊ é exibido. Não há
+//      criação de frames intermediários nem optical-flow — é frame pacing avançado.
 //
-//  [8] Local Upscaling Mode
-//      Modo HUD (localUpscalingMode=3) força detecção de HUD + compressão
-//      de blocos independentemente das preferências globais de filtro.
+//  [8] Local Upscaling (seleção de modo de scaler do MediaCodec)
+//      Configura o MediaCodec.VIDEO_SCALING_MODE conforme a preferência.
+//      Modo "Lanczos" usa VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING —
+//      o scaler de alta qualidade do hardware Android, não uma implementação
+//      Lanczos própria. Modo HUD força ativação de Block Analysis + HUD Detection.
 //
 // CORREÇÕES DE ARQUITETURA (bugs de estado em runtime):
 //
@@ -153,6 +176,26 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int HUD_REGION_SIZE = 32;
     private static final int DEFAULT_SHARPNESS_BASE = 50;
     private int localSmoothingQueueLimit = 2;
+
+    // Adaptive Sharpness: acumula o sharpness médio calculado por frame e aplica
+    // via KEY_VIDEO_QP_P_MAX ao decoder a cada SHARPNESS_APPLY_INTERVAL frames.
+    // QP mais baixo = mais qualidade/nitidez; mais alto = mais compressão/suavização.
+    private float accumulatedSharpness = 0f;
+    private int sharpnessFrameCount = 0;
+    private static final int SHARPNESS_APPLY_INTERVAL = 30; // aplica a cada 30 frames (~0.5s a 60fps)
+    private static final int SHARPNESS_QP_MIN = 10; // QP mínimo (máxima nitidez)
+    private static final int SHARPNESS_QP_MAX = 40; // QP máximo (suavização)
+
+    // Bitrate dinâmico baseado em similaridade de frames.
+    // Após BITRATE_REDUCE_THRESHOLD frames similares consecutivos, solicita redução de bitrate.
+    // Após BITRATE_RESTORE_THRESHOLD frames não-similares consecutivos, restaura o bitrate original.
+    private int consecutiveSimilarFrames = 0;
+    private int consecutiveDissimilarFrames = 0;
+    private int currentDynamicBitrate = 0; // 0 = não inicializado; usa prefs.bitrate como base
+    private boolean bitrateReduced = false;
+    private static final int BITRATE_REDUCE_THRESHOLD = 10;  // frames similares para reduzir
+    private static final int BITRATE_RESTORE_THRESHOLD = 5;  // frames distintos para restaurar
+    private static final int BITRATE_REDUCE_PERCENT = 30;    // redução de 30% quando cena estável
 
     // Used on versions < 5.0
     private ByteBuffer[] legacyInputBuffers;
@@ -431,10 +474,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
     
-    // NEW: Configure dynamic bitrate adjustment
+    // Solicita ao host encoder (Sunshine/NVENC) que ajuste o bitrate via control stream.
+    // Esta é a única rota que realmente reduz bytes transmitidos pela rede.
     public void updateDynamicBitrate(int newBitrate) {
-        // Implementará ajustes de bitrate em tempo real baseado em latência
-        LimeLog.debug("Dynamic bitrate update requested: " + newBitrate + " kbps");
+        if (newBitrate <= 0) {
+            LimeLog.warning("Dynamic bitrate update ignored: invalid value " + newBitrate);
+            return;
+        }
+        LimeLog.info("Dynamic bitrate update: requesting " + newBitrate + " kbps from host encoder");
+        try {
+            MoonBridge.requestBitrateChange(newBitrate);
+        } catch (Exception e) {
+            LimeLog.warning("Dynamic bitrate update failed: " + e.getMessage());
+        }
     }
 
     public MediaCodecDecoderRenderer(Activity activity, PreferenceConfiguration prefs,
@@ -678,7 +730,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         if (prefs.localUpscalingMode == 2) {
             videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
-            LimeLog.info("Local upscaling enabled: Lanczos requested, using hardware high-quality scaler path");
+            LimeLog.info("Local upscaling enabled: high-quality hardware scaler path (VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)");
         }
         else if (prefs.localUpscalingMode == 3) {
             // Modo "Detecção de HUD": usa o scaler de hardware normalmente, mas ativa
@@ -687,7 +739,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
             prefs.hudDetectionEnabled = true;
             prefs.blockCompressionEnabled = true;
-            LimeLog.info("Local upscaling enabled: HUD detection mode, reducing resolution on repeated non-central regions");
+            LimeLog.info("Local upscaling enabled: HUD detection mode (detects repeated non-central regions; note: does not reduce stream resolution on the host)");
+
         }
         else {
             videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
@@ -749,6 +802,33 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 // FIX-1: AtomicInteger com cap em 2, thread-safe com o render thread
                 pendingDeduplicationDrops.getAndUpdate(v -> Math.min(v + 1, 2));
             }
+            consecutiveSimilarFrames++;
+            consecutiveDissimilarFrames = 0;
+        } else {
+            consecutiveDissimilarFrames++;
+            consecutiveSimilarFrames = 0;
+        }
+
+        if (prefs.bitrateOptimization) {
+            if (currentDynamicBitrate <= 0) {
+                currentDynamicBitrate = prefs.bitrate; // inicializa com o bitrate configurado pelo usuário
+            }
+            if (!bitrateReduced && consecutiveSimilarFrames >= BITRATE_REDUCE_THRESHOLD) {
+                // Cena estável: reduz bitrate para economizar rede
+                int reducedBitrate = currentDynamicBitrate * (100 - BITRATE_REDUCE_PERCENT) / 100;
+                reducedBitrate = Math.max(reducedBitrate, prefs.bitrate / 4); // floor em 25% do original
+                updateDynamicBitrate(reducedBitrate);
+                currentDynamicBitrate = reducedBitrate;
+                bitrateReduced = true;
+                LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene, " + consecutiveSimilarFrames + " similar frames)");
+            } else if (bitrateReduced && consecutiveDissimilarFrames >= BITRATE_RESTORE_THRESHOLD) {
+                // Cena mudou: restaura bitrate original
+                updateDynamicBitrate(prefs.bitrate);
+                currentDynamicBitrate = prefs.bitrate;
+                bitrateReduced = false;
+                consecutiveSimilarFrames = 0;
+                LimeLog.info("Bitrate restored to " + prefs.bitrate + " kbps (scene changed, " + consecutiveDissimilarFrames + " dissimilar frames)");
+            }
         }
 
         if (prefs.blockCompressionEnabled) {
@@ -769,10 +849,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
      * A cada (x) frames [prefs.areaDedupCheckInterval], olha para os (y) frames
      * anteriores [prefs.areaDedupLookbackFrames] e tenta achar um padrão local (uma área
      * que se repete de forma praticamente idêntica ao longo dessa janela). Se achar,
-     * marca os próximos (z) frames [prefs.areaDedupReplaceFrames] para serem substituídos
-     * por uma imagem genérica com o movimento dos frames anteriores (na prática, os
-     * frames marcados são "dropados" na saída, então a superfície de vídeo continua
-     * mostrando a última imagem renderizada, que já reflete esse movimento recente).
+     * marca os próximos (z) frames [prefs.areaDedupReplaceFrames] para serem descartados
+     * ANTES de entrar no decoder (submitDecodeUnit via queueInputBuffer com size=0),
+     * economizando CPU de decodificação. A superfície de vídeo continua exibindo o
+     * último frame decodificado. Não há substituição por "imagem genérica" —
+     * simplesmente o frame é dropado e a imagem anterior permanece na tela.
+     * Os bytes já foram recebidos pela rede neste ponto (sem economia de banda).
      */
     private void analyzeAreaDeduplication(byte[] currentSample) {
         if (areaDeduplicator == null) {
@@ -804,10 +886,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     /**
-     * 1) Compressão por regiões iguais + 2) Máscara de processamento + filtro adaptativo.
-     * Divide a amostra do frame em blocos (8x8/16x16, configurável por prefs.blockSize).
-     * Blocos uniformes (mesma cor/quase mesma cor) são marcados na máscara para serem
-     * copiados direto, sem filtro. Blocos com detalhe recebem nitidez adaptativa.
+     * Análise de blocos da amostra do bitstream + Máscara de processamento + Filtro adaptativo.
+     * NOTA: Não há compressão de vídeo aqui. O frame original é enviado integralmente
+     * ao decoder sem modificação. O que ocorre é:
+     *  1) Os 48 bytes da amostra do bitstream comprimido são interpretados como intensidades
+     *     de cinza (pseudo-imagem) — isso é uma heurística, não análise de pixels reais.
+     *  2) Essa pseudo-imagem é dividida em blocos; blocos "uniformes" são marcados na
+     *     ProcessingMask para indicar pouco detalhe.
+     *  3) O AdaptiveSharpnessFilter usa a máscara para calcular a força de nitidez por bloco.
+     *     O valor calculado é retornado mas não é aplicado por nenhum pipeline de vídeo atual.
      */
     private void analyzeBlockCompression(byte[] currentSample) {
         if (blockCompressionAnalyzer == null || processingMask == null || adaptiveSharpnessFilter == null) {
@@ -845,10 +932,35 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
 
             if (prefs.adaptiveSharpness) {
-                // Consulta a nitidez adaptativa para este bloco (mais nitidez onde há
-                // detalhe, menos/zero em áreas lisas). Usado para decidir a força do
-                // filtro de nitidez a ser aplicado pelo pipeline de vídeo.
-                adaptiveSharpnessFilter.getSharpnessForBlock(processingMask, blockX, 0);
+                accumulatedSharpness += adaptiveSharpnessFilter.getSharpnessForBlock(processingMask, blockX, 0);
+            }
+        }
+
+        if (prefs.adaptiveSharpness) {
+            sharpnessFrameCount++;
+            if (sharpnessFrameCount >= SHARPNESS_APPLY_INTERVAL) {
+                float avgSharpness = (processingMask.getColumns() > 0)
+                        ? accumulatedSharpness / (sharpnessFrameCount * processingMask.getColumns())
+                        : DEFAULT_SHARPNESS_BASE;
+                // Mapeia sharpness [0-100] para QP invertido: sharpness alto = QP baixo (mais nitidez)
+                int targetQp = SHARPNESS_QP_MAX - Math.round((avgSharpness / 100f) * (SHARPNESS_QP_MAX - SHARPNESS_QP_MIN));
+                targetQp = Math.max(SHARPNESS_QP_MIN, Math.min(SHARPNESS_QP_MAX, targetQp));
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    try {
+                        Bundle params = new Bundle();
+                        params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, prefs.bitrate * 1000);
+                        // Aplica QP ao decoder para orientar o pipeline de qualidade de vídeo
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            params.putInt("video-qp-p-max", targetQp);
+                            params.putInt("video-qp-p-min", Math.max(SHARPNESS_QP_MIN, targetQp - 10));
+                        }
+                        videoDecoder.setParameters(params);
+                    } catch (Exception e) {
+                        // Alguns decoders não suportam esses parâmetros em runtime — ignora silenciosamente
+                    }
+                }
+                accumulatedSharpness = 0f;
+                sharpnessFrameCount = 0;
             }
         }
 
@@ -858,9 +970,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     /**
-     * 3) Detecção de HUD. Rastreia regiões não centrais do frame que se repetem muito
-     * entre frames (HUD, minimapa, contador de munição, menus) e calcula o quanto a
-     * resolução dessas regiões pode ser reduzida. O restante do frame usa filtros leves.
+     * Detecção de HUD — análise e cálculo informativo.
+     * Rastreia regiões não-centrais do frame que se repetem entre frames consecutivos
+     * (HUD, minimapa, contador de munição, menus) e calcula um percentual de
+     * "redução de resolução possível" para cada região (hudDetector.computeResolutionReduction).
+     * LIMITAÇÃO: esse valor é informativo. O Android recebe um stream H.264/HEVC/AV1
+     * já codificado pelo PC — não é possível reduzir a resolução de uma região do
+     * stream no cliente sem modificar o encoder remoto (Sunshine/NVENC). A detecção
+     * serve como insumo para futuras integrações com o host ou para o overlay de stats.
      */
     private void analyzeHudRegions(int overallSimilarity) {
         if (hudRepeatStreakByRegion == null || hudRepeatStreakByRegion.length == 0) {
@@ -936,14 +1053,23 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     /**
-     * Aplica interpolação temporal ao timestamp de renderização do frame.
+     * Frame pacing avançado — ajusta o timestamp de apresentação do frame.
+     *
+     * IMPORTANTE: Isso é frame pacing, não frame interpolation. Nenhum frame novo
+     * é criado — o método apenas altera QUANDO o frame existente é exibido, via
+     * releaseOutputBuffer(index, renderTimeNanos). Não há optical-flow nem síntese
+     * de conteúdo intermediário (como DLSS Frame Generation ou SVP).
+     *
+     * O efeito perceptível é suavização do ritmo de apresentação (reduz microstutter),
+     * não aumento real de frame rate. Curvas de easing disponíveis:
+     *   linear, ease-in-out, cubic (smoothstep), exponencial, smooth-step (Perlin).
      *
      * Bugs corrigidos vs. versão anterior:
      *  1) O switch de transitionFrameMode codificava forças fixas (25/50/75%) ignorando
      *     prefs.transitionStrength — agora a força vem diretamente da preferência.
      *  2) Não havia respeito à frequência de transição (prefs.transitionFrequencyMs);
-     *     frames eram sempre interpolados independentemente do intervalo decorrido.
-     *  3) O tipo de interpolação era sempre "linear implícito" sem suporte a outras curvas.
+     *     frames eram sempre ajustados independentemente do intervalo decorrido.
+     *  3) O tipo de easing era sempre "linear implícito" sem suporte a outras curvas.
      *  4) transitionFrameMode=0 + localMotionSmoothing=true caía no default de 25%, mas
      *     agora usa corretamente prefs.transitionStrength com o tipo configurado.
      */
@@ -1244,9 +1370,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     /**
-     * Inicializa a compressão por regiões iguais (blocos), a máscara de processamento,
+     * Inicializa o analisador de blocos do bitstream, a máscara de processamento,
      * o filtro adaptativo de nitidez e o detector de HUD, agora que já conhecemos
-     * as dimensões do vídeo.
+     * as dimensões do vídeo. Nenhuma dessas estruturas comprime ou modifica o stream
+     * — são apenas heurísticas de análise local para orientar decisões de drop e pacing.
      */
     private void initLocalFrameOptimizationState(int width, int height) {
         int blockSize = prefs.blockSize > 0 ? prefs.blockSize : 16;
@@ -1274,6 +1401,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.pendingDeduplicationDrops.set(0);
         this.lastFrameSample = null;
         this.lastBitrateAnalysisMs = 0;
+
+        // Reset adaptive sharpness accumulator
+        this.accumulatedSharpness = 0f;
+        this.sharpnessFrameCount = 0;
+
+        // Reset bitrate dinâmico — ao reiniciar, volta ao bitrate original para não
+        // manter uma redução de bitrate de uma sessão anterior ou após recovery.
+        this.consecutiveSimilarFrames = 0;
+        this.consecutiveDissimilarFrames = 0;
+        this.currentDynamicBitrate = 0;
+        this.bitrateReduced = false;
     }
 
     // All threads that interact with the MediaCodec instance must call this function regularly!
@@ -1311,6 +1449,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 lastFrameSample = null;          // força nova baseline de comparação pós-recovery
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
                 areaDedupFrameCounter = 0;
+                // Restaura bitrate original após recovery — não manter redução de bitrate
+                // de antes da falha do codec, que poderia impedir a recuperação correta.
+                if (bitrateReduced) {
+                    updateDynamicBitrate(prefs.bitrate);
+                    currentDynamicBitrate = prefs.bitrate;
+                    bitrateReduced = false;
+                }
+                consecutiveSimilarFrames = 0;
+                consecutiveDissimilarFrames = 0;
 
                 // If we just need a flush, do so now with all threads quiesced.
                 if (codecRecoveryType.get() == CR_RECOVERY_TYPE_FLUSH) {
@@ -1995,13 +2142,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return MoonBridge.DR_OK;
         }
         
-        // Jump-frame (telemetria): NÃO descartamos mais quadros aqui.
-        // Quadros P dependem de quadros anteriores para decodificar corretamente;
-        // pular a submissão ao decoder quebrava a cadeia de referência e causava
-        // corrupção de vídeo / erros no decoder, derrubando a conexão (bug corrigido).
-        // Além disso, os bytes do quadro já foram recebidos pela rede neste ponto,
-        // então descartar aqui nunca economizava banda de fato.
-        // Mantemos apenas a contagem para fins estatísticos/overlay de desempenho.
+        // Jump-frame: agenda drop de frames P na SAÍDA do decoder via pendingDeduplicationDrops.
+        // O frame continua sendo decodificado normalmente (a cadeia de referência H.264/HEVC
+        // permanece intacta), mas shouldDropOutputFrame() suprime a apresentação na tela.
+        // Isso economiza GPU/display sem corromper o decoder.
         if (jumpFrameMode != StreamConfiguration.JUMPFRAME_MODE_OFF) {
             jumpFrameCounter++;
 
@@ -2018,9 +2162,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     break;
             }
 
+            // Drop na SAÍDA do decoder (shouldDropOutputFrame), não na entrada.
+            // Frames P já decodificados podem ser descartados com segurança —
+            // a cadeia de referência do decoder permanece intacta porque o frame
+            // ainda foi decodificado internamente; só a apresentação é suprimida.
             if (frameType != MoonBridge.FRAME_TYPE_IDR &&
                 jumpFrameCounter <= framesToSkip &&
                 jumpFrameCounter < JUMPFRAME_COUNTER_INTERVAL) {
+                pendingDeduplicationDrops.getAndUpdate(v -> Math.min(v + 1, 3));
                 activeWindowVideoStats.framesDroppedByJumpFrame++;
             }
 
