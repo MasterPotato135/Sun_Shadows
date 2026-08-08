@@ -332,6 +332,33 @@ class AdaptiveSharpnessFilter {
  * limiar de similaridade e tamanho da grade de áreas) só é exposta/habilitada quando a
  * Deduplicação de Áreas está ativa (ver PreferenceConfiguration.areaDeduplicationEnabled).
  */
+/**
+ * Deduplicador de áreas — descarte pré-decoder baseado em amostras do bitstream.
+ *
+ * COMO FUNCIONA:
+ * A amostra de FRAME_SAMPLE_SIZE bytes é dividida em (gridSize) segmentos contíguos,
+ * cada um representando uma "área" do bitstream. O histórico circular guarda as últimas
+ * (y) amostras. A cada chamada, cada área é comparada byte a byte com suas versões
+ * anteriores: se a similaridade de uma área for >= threshold em TODOS os frames do
+ * histórico, essa área é considerada estável.
+ *
+ * DECISÃO DE DESCARTE (frame inteiro):
+ * O frame só é descartado pré-decoder quando a PROPORÇÃO de áreas estáveis no frame
+ * atual é >= stableAreaRatioThreshold (configurado pelo chamador, ex: 90%).
+ * Isso garante que uma única área em movimento impede o descarte — evitando que o
+ * usuário veja freeze em frames onde partes da cena mudaram.
+ *
+ * CONFIANÇA ACUMULADA:
+ * Mesmo com proporção suficiente, é exigida uma janela de CONFIDENCE_MAX confirmações
+ * consecutivas antes de descartar. Isso elimina falsos positivos de cenas com micro-
+ * variações recorrentes (partículas, cursor piscando).
+ *
+ * RESULTADO:
+ * - Cena toda parada por N frames → descarta frame inteiro pré-decoder (economiza CPU)
+ * - Qualquer área em movimento → não descarta (sem artefatos visuais)
+ * - O último frame decodificado permanece na surface durante o freeze local
+ * - Bytes já foram recebidos pela rede → sem economia de banda, apenas CPU de decode
+ */
 class AreaDeduplicator {
 
     private final int gridSize;
@@ -339,14 +366,19 @@ class AreaDeduplicator {
     private int historyCount;
     private int historyHead;
 
+    // Bitmap de estabilidade por área, reutilizado entre chamadas para evitar alocação
+    private boolean[] stableAreaBitmap;
+
+    // Nível de confiança acumulado: exige CONFIDENCE_MAX confirmações consecutivas
+    // antes de descartar, para eliminar falsos positivos de micro-variações.
+    private int confidenceLevel = 0;
+    private static final int CONFIDENCE_MAX = 3;
+
     AreaDeduplicator(int gridSize) {
         this.gridSize = Math.max(1, gridSize);
+        this.stableAreaBitmap = new boolean[this.gridSize];
     }
 
-    /**
-     * Garante que o histórico circular comporta (y) frames anteriores.
-     * Chamado sempre que prefs.areaDedupLookbackFrames (y) muda.
-     */
     private void ensureHistoryCapacity(int lookbackFrames) {
         int capacity = Math.max(1, lookbackFrames);
         if (history == null || history.length != capacity) {
@@ -357,127 +389,118 @@ class AreaDeduplicator {
     }
 
     /**
-     * Divide a amostra do frame em (gridSize) áreas e compara cada área do frame atual
-     * com a mesma área nos (y) frames anteriores guardados no histórico.
+     * Avalia cada área da amostra contra o histórico e preenche stableAreaBitmap.
+     * Área i é estável se sua similaridade com TODOS os frames anteriores >= threshold.
      *
-     * @return quantidade de áreas (0-gridSize) que se mantiveram estáveis (mesmo padrão
-     *         local) durante toda a janela de lookback.
+     * @return número de áreas estáveis (0..gridSize)
      */
-    private int countStableAreas(byte[] currentSample, int similarityThreshold) {
+    private int evaluateStableAreas(byte[] currentSample, int similarityThreshold) {
         if (currentSample == null || currentSample.length == 0 || historyCount == 0) {
+            for (int i = 0; i < gridSize; i++) stableAreaBitmap[i] = false;
             return 0;
         }
 
         int areaLength = Math.max(1, currentSample.length / gridSize);
-        int stableAreas = 0;
+        int stableCount = 0;
 
         for (int area = 0; area < gridSize; area++) {
             int start = area * areaLength;
-            int end = Math.min(currentSample.length, start + areaLength);
+            int end = (area == gridSize - 1)
+                    ? currentSample.length
+                    : Math.min(currentSample.length, start + areaLength);
             if (end <= start) {
+                stableAreaBitmap[area] = false;
                 continue;
             }
 
-            boolean stableAcrossWindow = true;
-            for (int i = 0; i < historyCount; i++) {
-                byte[] past = history[i];
+            boolean stable = true;
+            for (int h = 0; h < historyCount && stable; h++) {
+                byte[] past = history[h];
                 if (past == null || past.length != currentSample.length) {
-                    stableAcrossWindow = false;
+                    stable = false;
                     break;
                 }
-
                 int matching = 0;
                 int total = end - start;
                 for (int idx = start; idx < end; idx++) {
-                    if (currentSample[idx] == past[idx]) {
-                        matching++;
-                    }
+                    if (currentSample[idx] == past[idx]) matching++;
                 }
-
-                int areaSimilarity = (matching * 100) / total;
-                if (areaSimilarity < similarityThreshold) {
-                    stableAcrossWindow = false;
-                    break;
+                if ((matching * 100) / total < similarityThreshold) {
+                    stable = false;
                 }
             }
 
-            if (stableAcrossWindow) {
-                stableAreas++;
-            }
+            stableAreaBitmap[area] = stable;
+            if (stable) stableCount++;
         }
 
-        return stableAreas;
+        return stableCount;
     }
 
-    // Nível de confiança acumulado entre chamadas.
-    // Em vez de uma decisão binária por análise, o sistema exige que a estabilidade
-    // seja confirmada em dois estágios antes de descartar frames:
-    //   Estágio 1 (confiança BAIXA):  stableAreas >= metade → incrementa confidenceLevel
-    //   Estágio 2 (confiança ALTA):   stableAreas >= CONFIDENCE_HIGH_RATIO da grade → descarta
-    // Instabilidade decrementa o contador — se a cena mudar, o sistema reage rapidamente.
-    private int confidenceLevel = 0;
-    private static final int CONFIDENCE_HIGH_RATIO_NUM = 9; // 9/10 = 90% das áreas estáveis
-    private static final int CONFIDENCE_HIGH_RATIO_DEN = 10;
-    private static final int CONFIDENCE_MAX = 3; // confirmações consecutivas antes de agir
+    /**
+     * Retorna o bitmap de estabilidade da última análise.
+     * stableAreaBitmap[i] == true → área i foi estável em toda a janela de lookback.
+     * Válido apenas após chamar analyzeAndGetReplacementFrameCount().
+     */
+    boolean[] getStableAreaBitmap() {
+        return stableAreaBitmap;
+    }
+
+    int getGridSize() {
+        return gridSize;
+    }
 
     /**
-     * Executa a análise de padrão local com DOIS ESTÁGIOS DE CONFIANÇA.
+     * Analisa o frame atual e decide se ele deve ser descartado pré-decoder.
      *
-     * Antes (decisão binária):
-     *   stableAreas >= metade → descarta replaceFrames imediatamente
+     * A decisão é CONSERVADORA: o frame só é descartado quando a proporção de
+     * áreas estáveis é >= stableAreaRatioPercent E isso se confirmou em
+     * CONFIDENCE_MAX análises consecutivas. Uma única área em movimento impede
+     * o descarte se stableAreaRatioPercent for 100.
      *
-     * Agora (confiança acumulada):
-     *   Estágio 1 — similaridade moderada (>= metade das áreas estáveis):
-     *     incrementa confidenceLevel (máx CONFIDENCE_MAX). Não descarta ainda.
-     *   Estágio 2 — similaridade alta (>= 90% das áreas estáveis) E confidenceLevel
-     *     atingiu CONFIDENCE_MAX: descarta replaceFrames.
-     *   Instabilidade (< metade das áreas estáveis):
-     *     decrementa confidenceLevel rapidamente (passo 2) — reage rápido a mudanças.
-     *
-     * Isso reduz falsos positivos em cenas com pequenas variações recorrentes
-     * (ex.: animações de HUD, cursor piscando, partículas suaves) sem aumentar
-     * a latência de detecção de cenas verdadeiramente estáticas.
-     *
-     * @param currentSample       amostra do bitstream comprimido do frame atual
-     * @param lookbackFrames      quantos frames anteriores considerar na janela
-     * @param replaceFrames       quantos frames descartar pré-decoder quando padrão confirmado
-     * @param similarityThreshold limiar (%) de similaridade por área para considerá-la estável
-     * @return replaceFrames se padrão confirmado com alta confiança, ou 0 caso contrário
+     * @param currentSample           amostra do bitstream do frame atual (128 bytes)
+     * @param lookbackFrames          janela de histórico (y frames anteriores)
+     * @param replaceFrames           frames a descartar quando padrão confirmado
+     * @param similarityThreshold     limiar de similaridade por byte (%) por área
+     * @param stableAreaRatioPercent  % mínima de áreas estáveis para descartar (0-100)
+     *                                Ex: 100 = todas estáveis; 90 = 90% estáveis
+     * @return replaceFrames se deve descartar, 0 caso contrário
      */
     int analyzeAndGetReplacementFrameCount(byte[] currentSample, int lookbackFrames,
-                                            int replaceFrames, int similarityThreshold) {
+                                            int replaceFrames, int similarityThreshold,
+                                            int stableAreaRatioPercent) {
         ensureHistoryCapacity(lookbackFrames);
 
-        // BUG CORRIGIDO: comparação ANTES de inserir no histórico (evita auto-comparação).
-        int stableAreas = countStableAreas(currentSample, similarityThreshold);
+        // Avalia ANTES de inserir no histórico (evita auto-comparação)
+        int stableAreas = evaluateStableAreas(currentSample, similarityThreshold);
 
-        // Guarda o frame atual no histórico circular APÓS a comparação.
+        // Insere no histórico circular após a comparação
         if (currentSample != null) {
             history[historyHead] = currentSample;
             historyHead = (historyHead + 1) % history.length;
             historyCount = Math.min(historyCount + 1, history.length);
         }
 
-        boolean windowFull = historyCount >= (history != null ? history.length : Integer.MAX_VALUE);
-        if (!windowFull || gridSize <= 0) {
+        // Exige janela cheia antes de qualquer descarte
+        if (historyCount < history.length || gridSize <= 0) {
+            confidenceLevel = 0;
             return 0;
         }
 
-        int halfGrid = (gridSize + 1) / 2;
-        // Limiar alto: 90% das áreas estáveis (arredondado para cima)
-        int highThreshold = (gridSize * CONFIDENCE_HIGH_RATIO_NUM + CONFIDENCE_HIGH_RATIO_DEN - 1)
-                / CONFIDENCE_HIGH_RATIO_DEN;
+        // Proporção de áreas estáveis no frame atual
+        int stablePercent = (stableAreas * 100) / gridSize;
+        int threshold = Math.max(0, Math.min(100, stableAreaRatioPercent));
 
-        if (stableAreas >= halfGrid) {
-            // Estabilidade detectada: aumenta confiança
+        if (stablePercent >= threshold) {
             confidenceLevel = Math.min(CONFIDENCE_MAX, confidenceLevel + 1);
         } else {
-            // Instabilidade: decrementa rapidamente (passo 2) para reagir a mudanças de cena
+            // Reage rápido a mudanças: decrementa em 2
             confidenceLevel = Math.max(0, confidenceLevel - 2);
         }
 
-        // Só descarta quando a confiança está no máximo E a estabilidade é alta (>= 90%)
-        boolean highConfidence = confidenceLevel >= CONFIDENCE_MAX && stableAreas >= highThreshold;
-        return highConfidence ? Math.max(0, replaceFrames) : 0;
+        if (confidenceLevel >= CONFIDENCE_MAX) {
+            return Math.max(0, replaceFrames);
+        }
+        return 0;
     }
 }

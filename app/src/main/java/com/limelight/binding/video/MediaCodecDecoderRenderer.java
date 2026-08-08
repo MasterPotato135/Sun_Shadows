@@ -10,7 +10,7 @@
 // de fato, é necessário alterar o encoder remoto (Sunshine/NVENC) via control stream.
 //
 //  [1] Jump-frame (drop de frames na SAÍDA do decoder — NÃO reduz banda de rede)
-//      A cada 5 frames (JUMPFRAME_COUNTER_INTERVAL), incrementa pendingDeduplicationDrops
+//      A cada 5 frames (JUMPFRAME_COUNTER_INTERVAL), incrementa pendingJumpFrameDrops
 //      conforme o modo (light=1, medium=2, heavy=3 drops por janela). Os frames
 //      são decodificados normalmente; shouldDropOutputFrame() suprime a apresentação
 //      na surface antes de releaseOutputBuffer. Quadros P não são suprimidos na
@@ -33,18 +33,22 @@
 //      transmitido — o frame original segue inalterado para o decoder.
 //
 //  [4] Area Deduplication (descarte pré-decoder — economiza CPU de decodificação)
-//      A cada N frames (areaDedupCheckInterval), analisa os últimos Y frames
-//      e detecta sub-regiões estáveis (mesma amostra de bytes). Quando um
-//      padrão é encontrado, os próximos Z frames são descartados ANTES de
-//      entrar no decoder via queueInputBuffer(size=0), economizando CPU de
-//      decodificação. Não economiza banda de rede (bytes já recebidos).
+//      Divide a amostra de 128 bytes em (areaDedupGridSize) áreas e compara cada
+//      área com os últimos Y frames [areaDedupLookbackFrames]. Somente quando a
+//      proporção de áreas estáveis >= stableAreaRatioPercent (derivado do threshold
+//      configurado) E isso se confirma por CONFIDENCE_MAX análises consecutivas, os
+//      próximos Z frames [areaDedupReplaceFrames] são descartados ANTES de entrar
+//      no decoder via queueInputBuffer(size=0). Qualquer área em movimento impede
+//      o descarte, evitando freeze em frames onde partes da cena mudaram.
+//      Não economiza banda de rede (bytes já foram recebidos).
 //
-//  [5] Adaptive Sharpness (cálculo de intensidade por bloco — sem pipeline de vídeo)
-//      Usa a ProcessingMask do Block Analysis para calcular a intensidade de
-//      nitidez por bloco (0 em regiões uniformes, baseSharpness+20 em regiões
-//      com detalhe). O valor calculado é retornado por getSharpnessForBlock()
-//      mas não é aplicado por um pipeline de pós-processamento de vídeo —
-//      aguarda integração futura com filtros de superfície/shader.
+//  [5] Adaptive Sharpness [EXPERIMENTAL — desligado por padrão]
+//      Usa a ProcessingMask do Block Analysis para derivar um valor de QP e aplicá-lo
+//      ao decoder via MediaCodec.setParameters("video-qp-p-min/max"). QP é uma
+//      propriedade do encoder — decoders podem ignorar ou ter comportamento
+//      específico de fabricante. O código captura exceções silenciosamente.
+//      NÃO habilitar em produção até validar em hardware real que o parâmetro
+//      produz o efeito desejado.
 //
 //  [6] Frame Pacing / Motion Smoothing (interpolação de timestamp — NÃO cria frames novos)
 //      Ajusta o timestamp de apresentação (releaseOutputBuffer timestamp) via
@@ -60,18 +64,20 @@
 //
 // CORREÇÕES DE ARQUITETURA (bugs de estado em runtime):
 //
-//  [FIX-1] pendingDeduplicationDrops → AtomicInteger
-//      Era um int simples lido pelo Choreographer/rendererThread e escrito
-//      pelo input thread (analyzeFrameForLocalOptimizations). Race condition
-//      causava drops duplos ou perdas de drop, levando o MediaCodec a
-//      receber releaseOutputBuffer fora de ordem → CodecException → recovery.
+//  [FIX-1] Contadores de drop separados + CAS atômico
+//      pendingDeduplicationDrops foi substituído por dois AtomicIntegers independentes:
+//      pendingJumpFrameDrops (Jump-Frame) e pendingFrameDedupDrops (Local Frame Dedup).
+//      Misturá-los num único contador tornava impossível saber qual política consumiu
+//      qual drop. O consumo usa loop CAS em consumeDropIfPending() — o par anterior
+//      getAndDecrement()+incrementAndGet() não era atômico e permitia race condition
+//      entre Choreographer e rendererThread → CodecException → recovery.
 //
 //  [FIX-2] Reset de estado das otimizações no doCodecRecoveryIfRequired
 //      Durante recovery o decoder descarta todos os buffers internos. Se
-//      pendingDeduplicationDrops ou pendingAreaReplacementFrames ficassem
-//      com valor > 0 nesse momento, os próximos frames válidos (pós-IDR)
+//      pendingJumpFrameDrops, pendingFrameDedupDrops ou pendingAreaReplacementFrames
+//      ficassem com valor > 0 nesse momento, os próximos frames válidos (pós-IDR)
 //      seriam descartados — impedindo o decoder de receber dados e fazendo
-//      as 10 tentativas de recovery falharem em cascata. Agora ambos são
+//      as 10 tentativas de recovery falharem em cascata. Agora todos são
 //      zerados atomicamente junto com nextInputBuffer/outputBufferQueue.
 //
 //  [FIX-3] pseudoFrameBuffer reutilizável (sem alocação por frame)
@@ -956,11 +962,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         long startNs = System.nanoTime();
 
+        // stableAreaRatioPercent: percentual mínimo de áreas que precisam estar estáveis
+        // para que o frame seja descartado. 100 = todas as áreas devem estar estáveis
+        // (mais conservador, sem artefatos). Valores menores descartam mais agressivamente.
+        // Usa prefs.areaDedupSimilarityThreshold como proxy do limiar de área, e um
+        // limiar fixo de 95% de áreas estáveis para garantir que frames com movimento
+        // em qualquer região não sejam descartados.
+        int stableAreaRatioPercent = Math.max(80, Math.min(100, prefs.areaDedupSimilarityThreshold));
+
         int replacementFrames = areaDeduplicator.analyzeAndGetReplacementFrameCount(
                 currentSample,
                 Math.max(1, prefs.areaDedupLookbackFrames),
                 Math.max(0, prefs.areaDedupReplaceFrames),
-                Math.max(0, Math.min(100, prefs.areaDedupSimilarityThreshold)));
+                Math.max(0, Math.min(100, prefs.areaDedupSimilarityThreshold)),
+                stableAreaRatioPercent);
 
         if (replacementFrames > 0) {
             activeWindowVideoStats.areaPatternsDetected++;
@@ -1501,7 +1516,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 outputBufferQueue.clear();
 
                 // FIX-2: zera estado das otimizações junto com os buffers do codec.
-                // Se pendingDeduplicationDrops ou pendingAreaReplacementFrames ficarem > 0
+                // Se pendingJumpFrameDrops, pendingFrameDedupDrops ou pendingAreaReplacementFrames ficarem > 0
                 // durante o recovery, os primeiros frames válidos pós-IDR seriam descartados,
                 // impedindo o decoder de receber dados e fazendo todas as 10 tentativas
                 // de recovery falharem em cascata — o que gera o "Decodificador Falhou".
@@ -2204,7 +2219,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return MoonBridge.DR_OK;
         }
         
-        // Jump-frame: agenda drop de frames P na SAÍDA do decoder via pendingDeduplicationDrops.
+        // Jump-frame: agenda drop de frames P na SAÍDA do decoder via pendingJumpFrameDrops.
         // O frame continua sendo decodificado normalmente (a cadeia de referência H.264/HEVC
         // permanece intacta), mas shouldDropOutputFrame() suprime a apresentação na tela.
         // Isso economiza GPU/display sem corromper o decoder.
