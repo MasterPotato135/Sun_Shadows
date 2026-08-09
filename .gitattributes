@@ -1,3 +1,2 @@
-# Moonlight native C code
-app/src/main/jni/moonlight-core/moonlight-common-c/** linguist-vendored
-app/src/main/jni/moonlight-core/simplejni.c linguist-vendored
+# Moonlight native C/C++ code
+app/src/main/jni/moonlight-core/** linguist-vendored
