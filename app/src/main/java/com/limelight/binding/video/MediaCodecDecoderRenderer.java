@@ -146,6 +146,9 @@ import android.os.SystemClock;
 import android.util.Range;
 import android.view.Choreographer;
 import android.view.SurfaceHolder;
+import android.telephony.TelephonyManager;
+import android.telephony.PhoneStateListener;
+import android.telephony.SignalStrength;
 
 public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
 
@@ -313,6 +316,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // evitando deadlock/reentrância no moonlight-common-c quando chamado de submitDecodeUnit.
     private HandlerThread bitrateHandlerThread;
     private Handler bitrateHandler;
+
+    // Monitoramento de sinal 4G: escala jumpFrameMode automaticamente quando ativo.
+    // O listener lê RSRP (potência do sinal LTE) e SINR (qualidade) da SignalStrength
+    // e mapeia para OFF/LIGHT/MEDIUM/HEAVY. Nunca escreve em currentDynamicBitrate
+    // nem chama nada do MoonBridge — só chama setJumpFrameMode() que é thread-safe.
+    private TelephonyManager telephonyManager;
+    private PhoneStateListener signalListener;
+    // jumpFrameMode base configurado pelo usuário (antes do monitoramento escalar).
+    // Guardamos para restaurar quando desativar o monitor ou se o sinal melhorar.
+    private int baseJumpFrameMode = StreamConfiguration.JUMPFRAME_MODE_OFF;
 
     private int numSpsIn;
     private int numPpsIn;
@@ -484,6 +497,131 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     public void setRenderTarget(SurfaceHolder renderTarget) {
         this.renderTarget = renderTarget;
+    }
+
+    /**
+     * Inicia o monitoramento de sinal 4G. Registra um PhoneStateListener que lê
+     * RSRP e SINR da SignalStrength LTE e escala o jumpFrameMode automaticamente:
+     *
+     *   Sinal bom   (RSRP >= -95 dBm, SINR >= 10) → restaura baseJumpFrameMode
+     *   Sinal médio (RSRP >= -105 dBm)             → pelo menos LIGHT
+     *   Sinal ruim  (RSRP >= -115 dBm)             → pelo menos MEDIUM
+     *   Sinal crítico (RSRP < -115 dBm)            → HEAVY
+     *
+     * Garante: nunca sobe acima de HEAVY, nunca divide por zero, nunca deixa
+     * pendingJumpFrameDrops > cap de 3 (já garantido pelo getAndUpdate existente).
+     */
+    private void startSignalMonitoring() {
+        try {
+            telephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            if (telephonyManager == null) {
+                LimeLog.warning("SignalMonitor: TelephonyManager not available");
+                return;
+            }
+
+            signalListener = new PhoneStateListener() {
+                @Override
+                public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+                    if (signalStrength == null) return;
+
+                    // Lê RSRP (potência) e SINR (qualidade) LTE via reflexão.
+                    // getLteRsrp()/getLteRssnr() existem desde API 17 (ocultos) e são públicos
+                    // a partir do API 29, mas o compilador Java rejeita chamadas diretas quando
+                    // compileSdk < 29 — mesmo dentro de um guard SDK_INT. Reflexão resolve isso
+                    // sem @RequiresApi e sem precisar elevar o compileSdk.
+                    int rsrp = Integer.MIN_VALUE;
+                    int sinr = Integer.MAX_VALUE;
+                    try {
+                        java.lang.reflect.Method mRsrp = signalStrength.getClass().getMethod("getLteRsrp");
+                        java.lang.reflect.Method mSinr = signalStrength.getClass().getMethod("getLteRssnr");
+                        Object rsrpObj = mRsrp.invoke(signalStrength);
+                        Object sinrObj = mSinr.invoke(signalStrength);
+                        if (rsrpObj instanceof Integer) rsrp = (Integer) rsrpObj;
+                        if (sinrObj instanceof Integer) sinr = (Integer) sinrObj;
+                    } catch (Exception e) {
+                        // Dispositivo não reporta LTE ou API não disponível; usará getLevel() abaixo
+                    }
+
+                    // Fallback: usa nível geral (0-4) se RSRP não disponível
+                    boolean rsrpValid = rsrp != Integer.MIN_VALUE && rsrp < -30;
+                    boolean sinrValid = sinr != Integer.MAX_VALUE;
+
+                    int newMode;
+                    if (rsrpValid) {
+                        // Mapeamento RSRP → jumpFrameMode
+                        // Não usa divisão — só comparações, sem risco de /0
+                        if (rsrp >= -95) {
+                            // Sinal excelente/bom: restaura configuração do usuário
+                            newMode = baseJumpFrameMode;
+                        } else if (rsrp >= -105) {
+                            // Sinal médio: garante pelo menos LIGHT
+                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_LIGHT);
+                        } else if (rsrp >= -115) {
+                            // Sinal ruim: escala para MEDIUM
+                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_MEDIUM);
+                        } else {
+                            // Sinal crítico (< -115 dBm): HEAVY
+                            newMode = StreamConfiguration.JUMPFRAME_MODE_HEAVY;
+                        }
+                        // Refinamento: se SINR também disponível e muito baixo, sobe um nível
+                        if (sinrValid && sinr < 30 && newMode < StreamConfiguration.JUMPFRAME_MODE_HEAVY) {
+                            // sinr < 30 significa SINR < 3 dB (muito ruidoso)
+                            newMode = Math.min(newMode + 1, StreamConfiguration.JUMPFRAME_MODE_HEAVY);
+                        }
+                    } else {
+                        // RSRP não disponível: usa nível geral do sinal (0=sem sinal, 4=excelente)
+                        int level = signalStrength.getLevel(); // 0-4
+                        // Garante que level está no intervalo válido (sem divisão)
+                        if (level < 0) level = 0;
+                        if (level > 4) level = 4;
+                        if (level >= 3) {
+                            newMode = baseJumpFrameMode;
+                        } else if (level == 2) {
+                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_LIGHT);
+                        } else if (level == 1) {
+                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_MEDIUM);
+                        } else {
+                            // level == 0: sem sinal
+                            newMode = StreamConfiguration.JUMPFRAME_MODE_HEAVY;
+                        }
+                    }
+
+                    // Só chama setJumpFrameMode se o modo realmente mudou (evita log spam)
+                    if (newMode != jumpFrameMode) {
+                        LimeLog.info("SignalMonitor: RSRP=" + (rsrpValid ? rsrp + " dBm" : "n/a")
+                                + " SINR=" + (sinrValid ? (sinr / 10.0) + " dB" : "n/a")
+                                + " → jumpFrameMode " + jumpFrameMode + " → " + newMode);
+                        setJumpFrameMode(newMode);
+                    }
+                }
+            };
+
+            telephonyManager.listen(signalListener, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS);
+            LimeLog.info("SignalMonitor: started (baseJumpFrameMode=" + baseJumpFrameMode + ")");
+        } catch (SecurityException e) {
+            // Permissão READ_PHONE_STATE não concedida; monitormento não ativa, jumpFrameMode fica intacto
+            LimeLog.warning("SignalMonitor: permission denied, monitoring disabled");
+            signalListener = null;
+            telephonyManager = null;
+        }
+    }
+
+    /**
+     * Para o monitoramento de sinal e restaura o jumpFrameMode base do usuário.
+     */
+    private void stopSignalMonitoring() {
+        if (telephonyManager != null && signalListener != null) {
+            try {
+                telephonyManager.listen(signalListener, PhoneStateListener.LISTEN_NONE);
+            } catch (Exception e) {
+                // ignora
+            }
+            signalListener = null;
+            telephonyManager = null;
+            // Restaura o modo original configurado pelo usuário
+            setJumpFrameMode(baseJumpFrameMode);
+            LimeLog.info("SignalMonitor: stopped, jumpFrameMode restored to " + baseJumpFrameMode);
+        }
     }
     
     // NEW: Configure jump-frame mode for 4G/Tailscale P2P optimization
@@ -1476,6 +1614,22 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         bitrateHandlerThread.start();
         bitrateHandler = new Handler(bitrateHandlerThread.getLooper());
 
+        // Monitoramento de sinal 4G: registra listener apenas se a preferência estiver ativa.
+        // Desativado por padrão — quando ativo, escala jumpFrameMode com base em RSRP/SINR,
+        // sem tocar no bitrateHandler nem em currentDynamicBitrate.
+        baseJumpFrameMode = prefs.jumpFrameMode;
+        if (prefs.signalMonitoring) {
+            // PhoneStateListener requer uma thread com Looper.
+            // setup() é chamado a partir de Thread-75 (sem Looper), por isso
+            // despachamos para o bitrateHandler que já possui um Looper próprio.
+            bitrateHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    startSignalMonitoring();
+                }
+            });
+        }
+
         initLocalFrameOptimizationState(width, height);
 
         return initializeDecoder(false);
@@ -2150,8 +2304,22 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
-        // Encerra a thread de bitrate (se iniciada)
+        // Encerra a thread de bitrate (se iniciada).
+        // O monitoramento de sinal precisa ser parado ANTES de destruir o bitrateHandler,
+        // pois o PhoneStateListener foi registrado no Looper do bitrateHandlerThread e
+        // telephonyManager.listen() deve ser chamado na mesma thread.
         if (bitrateHandlerThread != null) {
+            // Para o monitoramento de sinal 4G no Looper correto (antes de quitSafely)
+            if (bitrateHandler != null && signalListener != null) {
+                bitrateHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        stopSignalMonitoring();
+                    }
+                });
+            } else {
+                stopSignalMonitoring();
+            }
             bitrateHandlerThread.quitSafely();
             try {
                 bitrateHandlerThread.join();
@@ -2161,6 +2329,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
             bitrateHandlerThread = null;
             bitrateHandler = null;
+        } else {
+            // Para o monitoramento de sinal 4G (se estava ativo, sem bitrateHandler)
+            stopSignalMonitoring();
         }
 
         // Wait for the renderer thread to shut down

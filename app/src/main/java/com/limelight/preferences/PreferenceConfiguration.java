@@ -74,6 +74,7 @@ public class PreferenceConfiguration {
     private static final String TARGET_LATENCY_PREF_STRING = "seekbar_target_latency";
     private static final String ADAPTIVE_RESOLUTION_PREF_STRING = "checkbox_adaptive_resolution";
     private static final String BITRATE_OPTIMIZATION_PREF_STRING = "checkbox_bitrate_optimization";
+    private static final String SIGNAL_MONITORING_PREF_STRING = "checkbox_4g_signal_monitoring";
     private static final String BITRATE_ANALYSIS_INTERVAL_PREF_STRING = "seekbar_bitrate_analysis_interval";
     private static final String FRAME_SIMILARITY_THRESHOLD_PREF_STRING = "seekbar_frame_similarity_threshold";
     private static final String LOCAL_UPSCALING_PREF_STRING = "checkbox_local_upscaling";
@@ -242,6 +243,7 @@ public class PreferenceConfiguration {
     public boolean gamepadTouchpadAsMouse;
     public boolean gamepadMotionSensorsFallbackToDevice;
     public boolean mobileNetworkOptimizations;
+    public boolean signalMonitoring; // Monitoramento de sinal 4G: escala jumpFrameMode automaticamente
     public int jumpFrameMode;
     public int targetLatencyMs;
     public boolean adaptiveResolution;
@@ -724,6 +726,9 @@ public class PreferenceConfiguration {
 
         // Otimizações para 4G / redes móveis (já vêm predefinidas com os melhores valores)
         config.mobileNetworkOptimizations = prefs.getBoolean(MOBILE_NETWORK_OPT_PREF_STRING, DEFAULT_MOBILE_NETWORK_OPT);
+        // Monitoramento de sinal 4G: desativado por padrão; quando ativo, escala jumpFrameMode
+        // automaticamente em tempo real com base na degradação do sinal celular (RSRP/SINR).
+        config.signalMonitoring = prefs.getBoolean(SIGNAL_MONITORING_PREF_STRING, false);
         config.jumpFrameMode = Integer.parseInt(prefs.getString(JUMP_FRAME_MODE_PREF_STRING, String.valueOf(DEFAULT_JUMP_FRAME_MODE)));
         config.targetLatencyMs = prefs.getInt(TARGET_LATENCY_PREF_STRING, DEFAULT_TARGET_LATENCY_MS);
         config.adaptiveResolution = prefs.getBoolean(ADAPTIVE_RESOLUTION_PREF_STRING, DEFAULT_ADAPTIVE_RESOLUTION);
