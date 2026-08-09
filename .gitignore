@@ -5,7 +5,7 @@
 output.json
 output-metadata.json
 out/
-
+crash.txt
 # files for the dex VM
 *.dex
 

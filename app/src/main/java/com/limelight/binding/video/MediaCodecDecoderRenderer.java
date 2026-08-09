@@ -496,16 +496,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     
     // Solicita ao host encoder (Sunshine/NVENC) que ajuste o bitrate via control stream.
     // Esta é a única rota que realmente reduz bytes transmitidos pela rede.
+    // IMPORTANTE: esta chamada é despachada via bitrateHandler para garantir que
+    // MoonBridge.requestBitrateChange() nunca seja invocado dentro da thread de
+    // callback JNI (submitDecodeUnit), o que causaria deadlock/reentrância no
+    // moonlight-common-c e derrubava o processo com UnsatisfiedLinkError.
     public void updateDynamicBitrate(final int newBitrate) {
         if (newBitrate <= 0) {
             LimeLog.warning("Dynamic bitrate update ignored: invalid value " + newBitrate);
             return;
         }
-        // NOTA: MoonBridge.requestBitrateChange() foi declarado como native mas não possui
-        // implementação no moonlight-core. Chamar esse método lança UnsatisfiedLinkError
-        // e derruba o processo. A funcionalidade de bitrate dinâmico está desativada até
-        // que a implementação nativa seja adicionada ao moonlight-core.
-        LimeLog.info("Dynamic bitrate update suppressed (no native impl): " + newBitrate + " kbps");
+        if (bitrateHandler == null) {
+            LimeLog.warning("Dynamic bitrate update ignored: bitrateHandler not ready");
+            return;
+        }
+        bitrateHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    MoonBridge.requestBitrateChange(newBitrate);
+                    LimeLog.info("Dynamic bitrate updated to " + newBitrate + " kbps");
+                } catch (UnsatisfiedLinkError e) {
+                    // Biblioteca nativa não implementa requestBitrateChange; ignorar silenciosamente.
+                    LimeLog.warning("requestBitrateChange not available in native lib: " + e.getMessage());
+                }
+            }
+        });
     }
 
     public MediaCodecDecoderRenderer(Activity activity, PreferenceConfiguration prefs,
