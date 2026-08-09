@@ -14,10 +14,10 @@ While Moonlight is designed for excellent performance on local networks and stab
 
 Sun Shadows includes optimizations designed specifically for mobile networks:
 
-- Dynamic bitrate control — adjusts the host encoder bitrate in real time via the control stream when frame analysis detects changing conditions
+- Dynamic bitrate control — when frame analysis detects a stable or redundant stream, calls `MoonBridge.requestBitrateChange()` via the Moonlight control channel. The host encoder (Sunshine / NVENC) applies the new target. This is one of the few optimizations that can reduce actual network bandwidth usage.
 - Latency monitoring
 - Connection instability handling
-- Mobile network profiles
+- 4G signal monitoring — reads RSRP and SINR from the LTE `SignalStrength` API and automatically scales Jump-Frame mode in real time based on signal degradation. Requires `READ_PHONE_STATE` permission; silently disabled if not granted.
 - Bandwidth optimization
 
 Available profiles:
@@ -41,33 +41,35 @@ Frames are fully decoded before being dropped at the output stage, so the H.264/
 Modes (frames dropped per 5-frame window):
 
 - Disabled — no frames dropped
-- Light — 1 frame dropped per 5 (20% fewer frames rendered)
-- Medium — 2 frames dropped per 5 (40% fewer frames rendered)
-- Heavy — 3 frames dropped per 5 (60% fewer frames rendered)
+- Light — 1 frame dropped per 5 (~20% fewer frames rendered)
+- Medium — 2 frames dropped per 5 (~40% fewer frames rendered)
+- Heavy — 3 frames dropped per 5 (~60% fewer frames rendered)
 
-Useful for devices with limited GPU/display throughput on unstable connections.
+When 4G Signal Monitoring is active, Jump-Frame mode is scaled up automatically based on RSRP/SINR readings, floored at the user-configured base mode and capped at Heavy.
 
 ---
 
 ## Frame Deduplication
 
-Samples 48 bytes distributed across each incoming decode unit and compares them against the previous frame's sample. When byte-level similarity exceeds the configured threshold, the frame is suppressed at the decoder output stage.
+Samples 128 bytes distributed across each incoming decode unit and compares them against the previous frame's sample. When byte-level similarity exceeds the configured threshold, the frame is suppressed at the decoder **output** stage — after decoding has already occurred.
 
-This reduces rendering and display work for visually static content such as paused menus or idle HUDs. Network bytes are not saved — the frame has already arrived before the comparison occurs.
+This reduces rendering and display work for visually static content such as paused menus or idle HUDs. Network bytes are not saved and decode CPU is not saved — the frame has already been decoded before the comparison occurs.
 
 ---
 
 ## Area Deduplication
 
-At configurable intervals, analyzes a lookback window of recent frames to detect locally repeating patterns (static HUD regions, static backgrounds). When a repeating area is found, the next N frames are dropped before entering the decoder via `queueInputBuffer` with zero size, saving decode CPU for those frames.
+At configurable intervals, divides a 128-byte frame sample into a grid of areas (configurable size, default 8×8) and compares each area against a lookback window of recent frames. When the proportion of stable areas meets or exceeds `areaDedupStableAreaRatioPercent` (fixed at 95% in this version) for a sustained number of consecutive analyses, the next N frames are dropped **before** entering the decoder via `queueInputBuffer` with zero size.
 
-This is a CPU optimization, not a network optimization.
+This saves decode CPU for those frames. Any area showing movement prevents the drop. This is a CPU optimization, not a network optimization.
+
+Note: the 128-byte sample comes from the compressed bitstream, not decoded pixels. Area positions in the sample do not correspond to spatial positions in the rendered frame — this is a bitstream entropy heuristic, not spatial analysis.
 
 ---
 
 ## Bitrate Optimization
 
-Analyzes frame-level similarity and, when the stream appears stable or redundant, calls `MoonBridge.requestBitrateChange()` to send a bitrate adjustment request to the host via the Moonlight control channel. The host encoder (Sunshine / NVENC) then applies the new target.
+Analyzes frame-level similarity using a 128-byte sample. When the stream appears stable or redundant, posts a `MoonBridge.requestBitrateChange()` call to a dedicated background thread (to avoid blocking the JNI callback thread) and sends a bitrate adjustment request to the host via the Moonlight control channel. The host encoder (Sunshine / NVENC) then applies the new target bitrate.
 
 This is one of the few optimizations that can affect actual network bandwidth usage, as it operates on the host encoder side.
 
@@ -75,60 +77,63 @@ This is one of the few optimizations that can affect actual network bandwidth us
 
 ## Block Compression Analysis
 
-Samples 48 bytes from each frame, maps them to a grayscale pseudo-image, and divides that image into a grid. Uniform and non-uniform blocks are counted to estimate visual complexity. The result feeds into the Adaptive Sharpness system.
+Samples 128 bytes from each frame and maps them to a 16×8 grayscale pseudo-image (16 columns × 8 rows = 128 values). This grid is divided into blocks; uniform and non-uniform blocks are counted to estimate bitstream entropy. The result feeds into the Adaptive Sharpness system.
 
-Note: this analysis works on compressed bitstream bytes, not decoded pixel data. It is a heuristic, not a spatial analysis of the rendered frame.
+⚠️ The byte positions in the sample do not correspond to spatial positions in the rendered frame. "Block (3, 2) is uniform" does not mean "region (3, 2) of the screen is uniform." This is a compressed bitstream heuristic, not a spatial analysis of the decoded image. The ProcessingMask and sharpness values derived here should be treated as entropy estimates, not as spatial detail maps.
 
 ---
 
 ## HUD Detection
 
-Divides the frame conceptually into 32-pixel regions and tracks which regions remain similar across frames. Regions consistently outside the center that show low change are flagged as probable HUD. This information is used to bias Area Deduplication and Adaptive Sharpness away from non-HUD regions.
+Not currently implemented as a standalone component. Referenced in comments as a planned feature that would bias Area Deduplication and Adaptive Sharpness away from non-HUD regions.
 
 ---
 
 # 🖼️ Adaptive Sharpness
 
-Accumulates a per-frame sharpness estimate over a 30-frame window (~0.5 s at 60 fps). Every 30 frames, the average is mapped to a QP range and applied to the decoder via `MediaCodec.setParameters()` using the `video-qp-p-min` / `video-qp-p-max` keys.
+Accumulates a per-frame sharpness estimate derived from Block Compression Analysis over a 30-frame window (~0.5 s at 60 fps). Every 30 frames, the average is mapped to a QP range and applied to the **decoder** via `MediaCodec.setParameters()` using the `video-qp-p-min` / `video-qp-p-max` keys (range: QP 10–40).
 
-Higher measured sharpness → lower QP target (preserve detail).  
-Lower measured sharpness → higher QP target (allow more compression).
+Higher measured entropy → lower QP target (preserve detail).  
+Lower measured entropy → higher QP target (allow more compression).
 
-Support for these QP parameters varies by device and codec. On unsupported devices the call has no effect.
+Because the sharpness estimate is derived from compressed bitstream bytes rather than decoded pixels, the QP values reflect bitstream entropy, not visual sharpness of the rendered image. Support for `video-qp-p-min/max` varies by device and codec — on unsupported devices the call has no effect.
 
 ---
 
 # 🖥️ Local Upscaling
 
-Sun Shadows can stream at a lower resolution and scale up locally on the device using Android's `MediaCodec` scaling modes.
+Sun Shadows can stream at a lower resolution and scale up locally using Android's `MediaCodec` video scaling modes.
 
 Available modes:
 
 - Bilinear — `VIDEO_SCALING_MODE_SCALE_TO_FIT` (default Android scaler)
 - High Quality — `VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING` (hardware high-quality path; quality depends on the device's MediaCodec implementation)
 
-The "Lanczos" label in settings selects the high-quality hardware scaler path. Sun Shadows does not implement a software Lanczos filter.
+The "Lanczos" label in settings selects the `SCALE_TO_FIT_WITH_CROPPING` hardware path. Sun Shadows does not implement a software Lanczos filter — the name refers to the hardware scaler mode, whose actual algorithm depends on the device.
 
 Example:
 
 ```
-Stream: 720p
-↓
-Local Upscaling
-↓
-Display: 1080p
+Stream: 720p → Local Upscaling → Display: 1080p
 ```
 
 ---
 
 # 🎞️ Motion Smoothing
 
-Adjusts the presentation timestamp passed to `releaseOutputBuffer()` using mathematical curves. This changes *when* each frame is displayed relative to its nominal time, smoothing perceived frame pacing.
+Adjusts the presentation timestamp passed to `releaseOutputBuffer(index, renderTimeNanos)` using a `FramePacingController` that measures inter-frame intervals, calculates average timing and jitter, and schedules each frame to reduce microstutter.
 
-**This is frame pacing adjustment, not frame interpolation.** No new frames are synthesized. No optical flow is used.
+**This is frame pacing adjustment, not frame interpolation.** No new frames are synthesized. No optical flow is used. The effect is smoother perceived frame rhythm, not an increase in actual frame rate.
 
-Available curves:
+Three pacing modes are selected automatically from preferences:
 
+- Low Latency — minimal adjustment, prioritizes responsiveness
+- Balanced — moderate smoothing, driven by Choreographer vsync
+- Smooth — stronger correction, higher latency tolerance
+
+Available interpolation curve types (affect timestamp offset shape):
+
+- None
 - Linear
 - Ease In-Out
 - Cubic (Smoothstep)
@@ -141,9 +146,9 @@ Available curves:
 
 Designed for unstable connections:
 
-- Automatically retries lost connections
-- Avoids returning immediately to the PC list
-- Improves mobile streaming reliability
+- On a recoverable network error, re-launches the Game activity with an incremented reconnect attempt counter instead of returning to the PC list
+- Configurable maximum number of attempts (`autoReconnectAttempts`)
+- Disabled automatically if the error is not classified as recoverable
 
 ---
 
@@ -191,9 +196,10 @@ Sun Shadows is currently under active development.
 
 Features that are experimental or hardware-dependent:
 
-- Adaptive Sharpness (QP control — device support varies)
-- Area Deduplication
+- Adaptive Sharpness (QP control via `video-qp-p-min/max` — device support varies; derived from bitstream entropy, not pixel analysis)
+- Area Deduplication (bitstream heuristic — not spatial analysis)
 - Dynamic Bitrate (requires Sunshine host support)
+- 4G Signal Monitoring (requires `READ_PHONE_STATE` permission)
 - Aggressive mobile optimizations
 
 Feedback, testing, and contributions are welcome.
