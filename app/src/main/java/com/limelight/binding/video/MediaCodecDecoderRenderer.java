@@ -1037,11 +1037,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         long safeBitrateIntervalMs = prefs.bitrateAnalysisIntervalMs > 0
                 ? prefs.bitrateAnalysisIntervalMs : 50;
 
-        // Cada análise tem seu próprio timer — alterar bitrateAnalysisIntervalMs
-        // não afeta mais indiretamente a frequência de Block Analysis nem Area Dedup.
-        // Block e Area usam o mesmo intervalo base por ora; podem receber prefs próprias no futuro.
-        long safeBlockIntervalMs  = safeBitrateIntervalMs;
-        long safeAreaIntervalMs   = safeBitrateIntervalMs;
+        // Block: sem pref própria ainda — usa intervalo do bitrate como fallback explícito,
+        // não por acoplamento conceitual, mas por ausência de configuração independente na UI.
+        // Quando uma pref blockAnalysisIntervalMs for exposta, substituir aqui.
+        long safeBlockIntervalMs = safeBitrateIntervalMs;
+
+        // Area: areaDedupCheckInterval já existe mas conta em frames, não em ms.
+        // Convertemos para ms com base no fps alvo para ter granularidade independente
+        // do bitrate. Quando uma pref em ms for exposta na UI, substituir aqui.
+        int targetFps = prefs.fps > 0 ? prefs.fps : 60;
+        long frameMs = 1000L / targetFps;
+        long safeAreaIntervalMs = Math.max(frameMs, (long) prefs.areaDedupCheckInterval * frameMs);
 
         boolean runBitrate = (nowMs - lastBitrateAnalysisMs >= safeBitrateIntervalMs);
         boolean runBlock   = prefs.blockCompressionEnabled  && (nowMs - lastBlockAnalysisMs >= safeBlockIntervalMs);
