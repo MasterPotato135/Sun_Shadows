@@ -35,8 +35,8 @@
 //  [4] Area Deduplication (descarte pré-decoder — economiza CPU de decodificação)
 //      Divide a amostra de 128 bytes em (areaDedupGridSize) áreas e compara cada
 //      área com os últimos Y frames [areaDedupLookbackFrames]. Somente quando a
-//      proporção de áreas estáveis >= stableAreaRatioPercent (derivado do threshold
-//      configurado) E isso se confirma por CONFIDENCE_MAX análises consecutivas, os
+//      proporção de áreas estáveis >= stableAreaRatioPercent (prefs.areaDedupStableAreaRatioPercent,
+//      grandeza independente do threshold de similaridade) E isso se confirma por CONFIDENCE_MAX análises consecutivas, os
 //      próximos Z frames [areaDedupReplaceFrames] são descartados ANTES de entrar
 //      no decoder via queueInputBuffer(size=0). Qualquer área em movimento impede
 //      o descarte, evitando freeze em frames onde partes da cena mudaram.
@@ -167,6 +167,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int PSEUDO_FRAME_ROWS = 8;
     private byte[] lastFrameSample;
     private long lastBitrateAnalysisMs;
+    // Timers independentes por análise — evita que bitrateAnalysisIntervalMs
+    // controle indiretamente a frequência de Block e Area Dedup.
+    private long lastBlockAnalysisMs;
+    private long lastAreaAnalysisMs;
     // Contadores separados para cada política de drop — misturá-los num único
     // AtomicInteger tornava impossível saber qual motivo consumiu qual drop.
     // FIX-1: AtomicInteger para evitar race condition entre input thread e render/choreographer thread.
@@ -1027,21 +1031,36 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         long nowMs = SystemClock.uptimeMillis();
+
         // Guard: intervalo inválido (0 ou negativo) causaria análise em todo frame,
         // enfileirando posts no bitrateHandler 60x/s e levando a OOM.
-        long safeIntervalMs = prefs.bitrateAnalysisIntervalMs > 0
+        long safeBitrateIntervalMs = prefs.bitrateAnalysisIntervalMs > 0
                 ? prefs.bitrateAnalysisIntervalMs : 50;
-        if (nowMs - lastBitrateAnalysisMs < safeIntervalMs) {
+
+        // Cada análise tem seu próprio timer — alterar bitrateAnalysisIntervalMs
+        // não afeta mais indiretamente a frequência de Block Analysis nem Area Dedup.
+        // Block e Area usam o mesmo intervalo base por ora; podem receber prefs próprias no futuro.
+        long safeBlockIntervalMs  = safeBitrateIntervalMs;
+        long safeAreaIntervalMs   = safeBitrateIntervalMs;
+
+        boolean runBitrate = (nowMs - lastBitrateAnalysisMs >= safeBitrateIntervalMs);
+        boolean runBlock   = prefs.blockCompressionEnabled  && (nowMs - lastBlockAnalysisMs >= safeBlockIntervalMs);
+        boolean runArea    = prefs.areaDeduplicationEnabled && (nowMs - lastAreaAnalysisMs  >= safeAreaIntervalMs);
+
+        if (!runBitrate && !runBlock && !runArea) {
             return;
         }
-        lastBitrateAnalysisMs = nowMs;
 
         byte[] currentSample = sampleFrameBytes(data, length);
-        int similarity = getEncodedFrameSimilarity(lastFrameSample, currentSample);
-        lastFrameSample = currentSample;
-        activeWindowVideoStats.framesAnalyzedForBitrate++;
+        int similarity = 0;
+        if (runBitrate) {
+            lastBitrateAnalysisMs = nowMs;
+            similarity = getEncodedFrameSimilarity(lastFrameSample, currentSample);
+            lastFrameSample = currentSample;
+            activeWindowVideoStats.framesAnalyzedForBitrate++;
+        }
 
-        if (similarity >= prefs.frameSimilarityThreshold && frameType != MoonBridge.FRAME_TYPE_IDR) {
+        if (runBitrate && similarity >= prefs.frameSimilarityThreshold && frameType != MoonBridge.FRAME_TYPE_IDR) {
             activeWindowVideoStats.similarFramesDetected++;
             if (prefs.localFrameDeduplication) {
                 // FIX-1: AtomicInteger separado para dedup, com cap em 2
@@ -1049,12 +1068,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
             consecutiveSimilarFrames++;
             consecutiveDissimilarFrames = 0;
-        } else {
+        } else if (runBitrate) {
             consecutiveDissimilarFrames++;
             consecutiveSimilarFrames = 0;
         }
 
-        if (prefs.bitrateOptimization) {
+        if (runBitrate && prefs.bitrateOptimization) {
             // Guard: bitrate alvo inválido — não há base para calcular reduções/rampups.
             // Ocorre quando BITRATE_PREF_STRING e BITRATE_PREF_OLD_STRING ausentes nas prefs
             // (primeiro boot ou prefs corrompidas), resultando em prefs.bitrate == 0.
@@ -1101,11 +1120,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
-        if (prefs.blockCompressionEnabled) {
+        if (runBlock) {
+            lastBlockAnalysisMs = nowMs;
             analyzeBlockCompression(currentSample);
         }
 
-        if (prefs.areaDeduplicationEnabled) {
+        if (runArea) {
+            lastAreaAnalysisMs = nowMs;
             analyzeAreaDeduplication(currentSample);
         }
     }
@@ -1136,19 +1157,18 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         long startNs = System.nanoTime();
 
-        // stableAreaRatioPercent: percentual mínimo de áreas que precisam estar estáveis
-        // para que o frame seja descartado. 100 = todas as áreas devem estar estáveis
-        // (mais conservador, sem artefatos). Valores menores descartam mais agressivamente.
-        // Usa prefs.areaDedupSimilarityThreshold como proxy do limiar de área, e um
-        // limiar fixo de 95% de áreas estáveis para garantir que frames com movimento
-        // em qualquer região não sejam descartados.
-        int stableAreaRatioPercent = Math.max(80, Math.min(100, prefs.areaDedupSimilarityThreshold));
+        // areaSimilarityThreshold: quão similares dois blocos de área precisam ser (0–100).
+        // areaDedupStableAreaRatioPercent: que fração das áreas do frame precisam estar
+        // estáveis simultaneamente para autorizar o drop (0–100).
+        // São grandezas ortogonais — não derivar uma da outra.
+        int areaSimilarityThreshold = Math.max(0, Math.min(100, prefs.areaDedupSimilarityThreshold));
+        int stableAreaRatioPercent  = Math.max(0, Math.min(100, prefs.areaDedupStableAreaRatioPercent));
 
         int replacementFrames = areaDeduplicator.analyzeAndGetReplacementFrameCount(
                 currentSample,
                 Math.max(1, prefs.areaDedupLookbackFrames),
                 Math.max(0, prefs.areaDedupReplaceFrames),
-                Math.max(0, Math.min(100, prefs.areaDedupSimilarityThreshold)),
+                areaSimilarityThreshold,
                 stableAreaRatioPercent);
 
         if (replacementFrames > 0) {
@@ -1162,14 +1182,38 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     /**
      * Análise de blocos da amostra do bitstream + Máscara de processamento + Filtro adaptativo.
-     * NOTA: Não há compressão de vídeo aqui. O frame original é enviado integralmente
-     * ao decoder sem modificação. O que ocorre é:
-     *  1) Os 48 bytes da amostra do bitstream comprimido são interpretados como intensidades
-     *     de cinza (pseudo-imagem) — isso é uma heurística, não análise de pixels reais.
-     *  2) Essa pseudo-imagem é dividida em blocos; blocos "uniformes" são marcados na
-     *     ProcessingMask para indicar pouco detalhe.
-     *  3) O AdaptiveSharpnessFilter usa a máscara para calcular a força de nitidez por bloco.
-     *     O valor calculado é retornado mas não é aplicado por nenhum pipeline de vídeo atual.
+     *
+     * ⚠️  LIMITAÇÃO CONCEITUAL — leia antes de evoluir este método:
+     *
+     * Os bytes analisados aqui são uma amostra do bitstream H.264/H.265 *comprimido*,
+     * não pixels descomprimidos. A posição de um byte na amostra NÃO corresponde à
+     * posição (x, y) equivalente na imagem renderizada. Portanto:
+     *
+     *   "bloco (3, 2) é uniforme na pseudo-imagem"
+     *   ≠
+     *   "a região (3, 2) da tela exibida é uniforme"
+     *
+     * Isso significa que a ProcessingMask gerada aqui é uma *heurística genérica* sobre
+     * a entropia do bitstream, não uma análise espacial real. O AdaptiveSharpnessFilter
+     * usa essa máscara como proxy de "complexidade de cena", não como localização de detalhe.
+     *
+     * Consequências aceitas para 1.0.9:
+     *  - O QP calculado pode variar mesmo em cenas visualmente idênticas (ruído do codec).
+     *  - O valor de sharpness calculado NÃO é aplicado a nenhum pipeline de vídeo ativo
+     *    (o método retorna, mas nada consome o resultado além do log de stats).
+     *  - Não remover o Block Analysis: a estrutura existe para evolução futura com
+     *    análise espacial real (ex: via SurfaceTexture + GLES sampling pós-decode).
+     *
+     * Não tratar a saída desta função como análise espacial até que a fonte de dados
+     * seja substituída por pixels reais.
+     *
+     * Estrutura atual:
+     *  1) Os bytes da amostra comprimida são mapeados para intensidades uint8 (pseudo-imagem).
+     *  2) A pseudo-imagem é dividida em blocos; blocos "uniformes" são marcados na
+     *     ProcessingMask como de baixa entropia.
+     *  3) O AdaptiveSharpnessFilter calcula força de nitidez por bloco a partir da máscara.
+     *     O resultado é acumulado em accumulatedSharpness e usado para ajustar o QP do encoder
+     *     via MediaCodec.setParameters() — única ação concreta que esta análise produz.
      */
     private void analyzeBlockCompression(byte[] currentSample) {
         if (blockCompressionAnalyzer == null || processingMask == null || adaptiveSharpnessFilter == null) {
@@ -1672,6 +1716,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.pendingFrameDedupDrops.set(0);
         this.lastFrameSample = null;
         this.lastBitrateAnalysisMs = 0;
+        this.lastBlockAnalysisMs = 0;
+        this.lastAreaAnalysisMs = 0;
 
         // Reset adaptive sharpness accumulator
         this.accumulatedSharpness = 0f;
@@ -1724,6 +1770,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 pendingAreaReplacementFrames = 0;
                 lastFrameSample = null;          // força nova baseline de comparação pós-recovery
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
+                lastBlockAnalysisMs = 0;
+                lastAreaAnalysisMs = 0;
                 areaDedupFrameCounter = 0;
                 // Reset do pacing controller — garante que âncoras e histórico de intervalos
                 // não reflitam o estado pré-falha, evitando timestamps incorretos pós-IDR.

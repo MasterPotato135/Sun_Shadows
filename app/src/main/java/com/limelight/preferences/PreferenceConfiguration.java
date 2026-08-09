@@ -194,6 +194,10 @@ public class PreferenceConfiguration {
     // (z) quantos dos próximos frames são descartados antes do decoder (último frame fica na tela)
     private static final int DEFAULT_AREA_DEDUP_REPLACE_FRAMES = 3;
     private static final int DEFAULT_AREA_DEDUP_SIMILARITY_THRESHOLD = 90;
+    // Percentual mínimo de áreas que precisam estar estáveis para descartar o frame.
+    // Grandeza distinta de areaDedupSimilarityThreshold: não deve ser derivada dele.
+    // 95% é conservador: garante que qualquer movimento em ~1/20 das áreas impeça o drop.
+    private static final int DEFAULT_AREA_DEDUP_STABLE_AREA_RATIO_PERCENT = 95;
     private static final int DEFAULT_AREA_DEDUP_GRID_SIZE = 8;
 
     public static final int FRAME_PACING_MIN_LATENCY = 0;
@@ -276,6 +280,9 @@ public class PreferenceConfiguration {
     public int areaDedupLookbackFrames;     // (y)
     public int areaDedupReplaceFrames;      // (z)
     public int areaDedupSimilarityThreshold;
+    // Grandeza separada: percentual mínimo de áreas estáveis para autorizar o drop do frame.
+    // NÃO é derivado de areaDedupSimilarityThreshold — são métricas ortogonais.
+    public int areaDedupStableAreaRatioPercent;
     public int areaDedupGridSize;
 
     public static boolean isNativeResolution(int width, int height) {
@@ -759,6 +766,9 @@ public class PreferenceConfiguration {
         config.areaDedupLookbackFrames = prefs.getInt(AREA_DEDUP_LOOKBACK_FRAMES_PREF_STRING, DEFAULT_AREA_DEDUP_LOOKBACK_FRAMES);
         config.areaDedupReplaceFrames = prefs.getInt(AREA_DEDUP_REPLACE_FRAMES_PREF_STRING, DEFAULT_AREA_DEDUP_REPLACE_FRAMES);
         config.areaDedupSimilarityThreshold = prefs.getInt(AREA_DEDUP_SIMILARITY_THRESHOLD_PREF_STRING, DEFAULT_AREA_DEDUP_SIMILARITY_THRESHOLD);
+        // Na 1.0.9 este valor é fixo (sem exposição na UI): mantém a grandeza conceitualmente
+        // separada do threshold de similaridade desde já, sem bloquear exposição futura.
+        config.areaDedupStableAreaRatioPercent = DEFAULT_AREA_DEDUP_STABLE_AREA_RATIO_PERCENT;
         config.areaDedupGridSize = prefs.getInt(AREA_DEDUP_GRID_SIZE_PREF_STRING, DEFAULT_AREA_DEDUP_GRID_SIZE);
 
         return config;
