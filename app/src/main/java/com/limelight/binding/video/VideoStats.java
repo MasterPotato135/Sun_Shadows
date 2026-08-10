@@ -35,6 +35,12 @@ class VideoStats {
     int framesReplacedByAreaDeduplication;
     long areaDeduplicationAnalysisTimeMs;
 
+    // Latest-Frame-Wins: frames obsoletos descartados da outputBufferQueue
+    int framesDroppedAsStaleOutput;
+
+    // Pending-frames monitor: frames descartados na entrada por fila do decoder cheia
+    int framesDroppedByPendingMonitor;
+
     void add(VideoStats other) {
         this.decoderTimeMs += other.decoderTimeMs;
         this.totalTimeMs += other.totalTimeMs;
@@ -68,6 +74,10 @@ class VideoStats {
         this.areaPatternsDetected += other.areaPatternsDetected;
         this.framesReplacedByAreaDeduplication += other.framesReplacedByAreaDeduplication;
         this.areaDeduplicationAnalysisTimeMs += other.areaDeduplicationAnalysisTimeMs;
+
+        // Latest-Frame-Wins + Pending monitor
+        this.framesDroppedAsStaleOutput += other.framesDroppedAsStaleOutput;
+        this.framesDroppedByPendingMonitor += other.framesDroppedByPendingMonitor;
 
         if (this.measurementStartTimestamp == 0) {
             this.measurementStartTimestamp = other.measurementStartTimestamp;
@@ -105,6 +115,10 @@ class VideoStats {
         this.areaPatternsDetected = other.areaPatternsDetected;
         this.framesReplacedByAreaDeduplication = other.framesReplacedByAreaDeduplication;
         this.areaDeduplicationAnalysisTimeMs = other.areaDeduplicationAnalysisTimeMs;
+
+        // Latest-Frame-Wins + Pending monitor
+        this.framesDroppedAsStaleOutput = other.framesDroppedAsStaleOutput;
+        this.framesDroppedByPendingMonitor = other.framesDroppedByPendingMonitor;
     }
 
     void clear() {
@@ -136,6 +150,10 @@ class VideoStats {
         this.areaPatternsDetected = 0;
         this.framesReplacedByAreaDeduplication = 0;
         this.areaDeduplicationAnalysisTimeMs = 0;
+
+        // Latest-Frame-Wins + Pending monitor
+        this.framesDroppedAsStaleOutput = 0;
+        this.framesDroppedByPendingMonitor = 0;
     }
 
     VideoStatsFps getFps() {

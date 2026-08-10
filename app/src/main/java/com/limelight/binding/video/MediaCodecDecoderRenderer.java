@@ -309,6 +309,21 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int OUTPUT_BUFFER_QUEUE_LIMIT = 2;
     private long lastRenderedFrameTimeNanos;
 
+    // Latest-Frame-Wins: descarta frames da outputBufferQueue cujo PTS já passou
+    // mais de 1 intervalo de frame. Garante que o Choreographer nunca apresenta
+    // um frame defasado quando o decoder está adiantado na fila.
+    // frameIntervalUs é calculado em setup() a partir do refreshRate.
+    private long frameIntervalUs = 16667; // default 60 Hz; atualizado em setup()
+
+    // Pending-frames monitor: threshold de frames pendentes no decoder nativo
+    // acima do qual o próximo P-frame é descartado na entrada (size=0), aliviando
+    // a fila antes que o atraso se acumule. IDR nunca é descartado.
+    private static final int PENDING_FRAMES_DROP_THRESHOLD = 2;
+
+    // Thread priority do callback JNI: setThreadPriority é feito uma única vez
+    // por thread nativa. Guardamos se já foi feito para evitar syscall por frame.
+    private boolean jniThreadPrioritySet = false;
+
     // Controlador de frame pacing baseado em histórico real de intervalos.
     // Substitui o sistema de curvas fixas (linear/ease/cubic/etc.) por um
     // scheduler que mede avg interval + jitter e decide quando apresentar cada frame.
@@ -1657,6 +1672,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.initialHeight = height;
         this.videoFormat = format;
         this.refreshRate = redrawRate;
+        // Intervalo esperado entre frames em microssegundos — usado pelo Latest-Frame-Wins.
+        // Guard contra redrawRate=0 (não deve acontecer, mas evita divisão por zero).
+        this.frameIntervalUs = redrawRate > 0 ? (1_000_000L / redrawRate) : 16_667L;
 
         // Inicia thread dedicada para chamadas de requestBitrateChange(),
         // garantindo que nunca ocorram dentro da thread de callback JNI (submitDecodeUnit).
@@ -1774,6 +1792,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 pendingJumpFrameDrops.set(0);
                 pendingFrameDedupDrops.set(0);
                 pendingAreaReplacementFrames = 0;
+                // Reseta flag de thread priority: após recovery o codec pode usar uma thread
+                // nativa diferente, então precisamos elevar a prioridade novamente.
+                jniThreadPrioritySet = false;
                 lastFrameSample = null;          // força nova baseline de comparação pós-recovery
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
                 lastBlockAnalysisMs = 0;
@@ -2065,7 +2086,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             videoDecoder.releaseOutputBuffer(nextOutputFrame.index, true);
                         }
 
-                        lastRenderedFrameTimeNanos = renderTimeNanos;
+                        lastRenderedFrameTimeNanos = frameTimeNanos;
                         activeWindowVideoStats.totalFramesRendered++;
                     }
                 } catch (IllegalStateException ignored) {
@@ -2187,6 +2208,25 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                         // We're shutting down, so we can just drop this buffer on the floor
                                         // and it will be reclaimed when the codec is released.
                                         return;
+                                    }
+                                }
+
+                                // Latest-Frame-Wins: antes de enfileirar, verifica se o frame
+                                // mais antigo da fila já está obsoleto (passou mais de 1 intervalo
+                                // de frame desde o seu PTS). Se sim, descarta-o agora e enfileira
+                                // apenas o frame atual — o Choreographer nunca apresentará algo
+                                // defasado quando chegar o próximo vsync.
+                                OutputFrame staleHead = outputBufferQueue.peek();
+                                if (staleHead != null) {
+                                    long staleAgeUs = presentationTimeUs - staleHead.presentationTimeUs;
+                                    if (staleAgeUs > frameIntervalUs) {
+                                        // O frame na cabeça da fila é mais antigo que 1 frame-interval
+                                        // em relação ao frame recém-decodificado: joga fora.
+                                        OutputFrame removed = outputBufferQueue.poll();
+                                        if (removed != null) {
+                                            videoDecoder.releaseOutputBuffer(removed.index, false);
+                                            activeWindowVideoStats.framesDroppedAsStaleOutput++;
+                                        }
                                     }
                                 }
 
@@ -2506,7 +2546,45 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // Don't bother if we're stopping
             return MoonBridge.DR_OK;
         }
-        
+
+        // Thread priority: o callback JNI roda na prioridade default da thread nativa.
+        // Elevamos para THREAD_PRIORITY_VIDEO uma única vez por thread de entrada,
+        // reduzindo jitter causado por preempção de outras threads do processo.
+        // Process.setThreadPriority() é barato após a primeira chamada (syscall idempotente
+        // do ponto de vista do scheduler), mas guardamos a flag para evitar o overhead
+        // da chamada JNI a cada frame (~60x/s) quando já está no nível correto.
+        if (!jniThreadPrioritySet) {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_VIDEO);
+            jniThreadPrioritySet = true;
+        }
+
+        // Pending-frames monitor: se o decoder nativo já tem mais frames esperando
+        // processamento do que o threshold, descartamos o P-frame atual NA ENTRADA
+        // (size=0, igual ao area dedup), liberando a fila antes que o atraso acumule.
+        // IDR nunca é descartado — seria corrupção de GOP.
+        // Nota: getPendingVideoFrames() é uma chamada JNI, mas rápida (leitura de contador
+        // atômico no lado C). O overhead é aceitável pois ocorre apenas 1x por frame.
+        if (frameType != MoonBridge.FRAME_TYPE_IDR
+                && decodeUnitType == MoonBridge.BUFFER_TYPE_PICDATA) {
+            int pending = MoonBridge.getPendingVideoFrames();
+            if (pending > PENDING_FRAMES_DROP_THRESHOLD) {
+                // Obtém um buffer de entrada para devolvê-lo corretamente (evita vazar slot).
+                if (fetchNextInputBuffer()) {
+                    try {
+                        videoDecoder.queueInputBuffer(nextInputBufferIndex, 0, 0,
+                                enqueueTimeMs * 1000, 0);
+                    } catch (IllegalStateException e) {
+                        LimeLog.warning("PendingMonitor: failed to return input buffer: " + e.getMessage());
+                    }
+                    nextInputBufferIndex = -1;
+                    nextInputBuffer = null;
+                    fetchNextInputBuffer(); // pré-busca para o próximo frame
+                }
+                activeWindowVideoStats.framesDroppedByPendingMonitor++;
+                return MoonBridge.DR_OK;
+            }
+        }
+
         // Jump-frame: agenda drop de frames P na SAÍDA do decoder via pendingJumpFrameDrops.
         // O frame continua sendo decodificado normalmente (a cadeia de referência H.264/HEVC
         // permanece intacta), mas shouldDropOutputFrame() suprime a apresentação na tela.
