@@ -6,6 +6,11 @@
 // - Compressão agressiva em 4G
 package com.limelight.nvstream;
 
+import com.limelight.mods.MinBitrateFor4GConfig;
+import com.limelight.mods.MaxBitrateFor4GConfig;
+import com.limelight.mods.DefaultTargetLatencyMsConfig;
+import com.limelight.mods.DefaultMaxLatencyMsConfig;
+import com.limelight.mods.CellularTargetLatencyMsConfig;
 import com.limelight.nvstream.http.NvApp;
 import com.limelight.nvstream.jni.MoonBridge;
 
@@ -52,8 +57,8 @@ public class StreamConfiguration {
     private boolean enable4GOptimizations = false;
     private boolean enableTailscaleP2P = true;
     private int jumpFrameMode = JUMPFRAME_MODE_OFF;
-    private int targetLatencyMs = 50;
-    private int maxLatencyMs = 150;
+    private int targetLatencyMs = DefaultTargetLatencyMsConfig.DEFAULT_TARGET_LATENCY_MS;
+    private int maxLatencyMs = DefaultMaxLatencyMsConfig.DEFAULT_MAX_LATENCY_MS;
     private boolean enableFrameSkip = false;
     private boolean bitrateOptimization = false;
     private int bitrateAnalysisIntervalMs = 50;
@@ -64,8 +69,8 @@ public class StreamConfiguration {
     private int transitionFrameMode = 0;
     private boolean localFrameDeduplication = false;
     private boolean localMotionSmoothing = false;
-    private int minBitrateFor4G = 2000;  // 2Mbps mínimo
-    private int maxBitrateFor4G = 8000;  // 8Mbps máximo
+    private int minBitrateFor4G = MinBitrateFor4GConfig.MIN_BITRATE_FOR_4G;
+    private int maxBitrateFor4G = MaxBitrateFor4GConfig.MAX_BITRATE_FOR_4G;
     
     // Block compression + Adaptive processing
     private boolean blockCompressionEnabled = true;
@@ -253,7 +258,7 @@ public class StreamConfiguration {
                 config.enableFrameSkip = false;
                 config.jumpFrameMode = JUMPFRAME_MODE_LIGHT;
                 config.enableAdaptiveResolution = true;
-                config.targetLatencyMs = Math.max(config.targetLatencyMs, 80);
+                config.targetLatencyMs = Math.max(config.targetLatencyMs, CellularTargetLatencyMsConfig.CELLULAR_TARGET_LATENCY_MS);
                 if (config.width > 1920 || config.height > 1080) {
                     config.width = 1920;
                     config.height = 1080;

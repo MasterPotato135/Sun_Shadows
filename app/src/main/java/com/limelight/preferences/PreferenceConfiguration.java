@@ -8,6 +8,9 @@ import android.os.Build;
 import android.preference.PreferenceManager;
 import android.view.Display;
 
+import com.limelight.mods.DefaultMobileNetworkOptConfig;
+import com.limelight.mods.DefaultSignalMonitoringConfig;
+import com.limelight.mods.DefaultTargetLatencyMsConfig;
 import com.limelight.nvstream.jni.MoonBridge;
 
 public class PreferenceConfiguration {
@@ -146,12 +149,12 @@ public class PreferenceConfiguration {
     // O fork é focado em uso 4G: liga as otimizações de rede móvel por padrão para que
     // novos usuários se beneficiem imediatamente. Quem quiser o comportamento original do
     // Moonlight pode desligar manualmente em Configurações → Rede móvel.
-    private static final boolean DEFAULT_MOBILE_NETWORK_OPT = true;
+    private static final boolean DEFAULT_MOBILE_NETWORK_OPT = DefaultMobileNetworkOptConfig.DEFAULT_MOBILE_NETWORK_OPT;
     private static final int DEFAULT_JUMP_FRAME_MODE = 0; // Off
     // Alinhado com o targetLatencyMs padrão do StreamConfiguration (50 ms).
     // O valor anterior (80 ms) era inconsistente: o StreamConfiguration assumia 50 ms
     // mas as prefs entregavam 80 ms na primeira inicialização do app.
-    private static final int DEFAULT_TARGET_LATENCY_MS = 50;
+    private static final int DEFAULT_TARGET_LATENCY_MS = DefaultTargetLatencyMsConfig.DEFAULT_TARGET_LATENCY_MS;
     private static final boolean DEFAULT_ADAPTIVE_RESOLUTION = false;
     private static final boolean DEFAULT_BITRATE_OPTIMIZATION = true;
     private static final int DEFAULT_BITRATE_ANALYSIS_INTERVAL_MS = 50;
@@ -735,7 +738,7 @@ public class PreferenceConfiguration {
         config.mobileNetworkOptimizations = prefs.getBoolean(MOBILE_NETWORK_OPT_PREF_STRING, DEFAULT_MOBILE_NETWORK_OPT);
         // Monitoramento de sinal 4G: desativado por padrão; quando ativo, escala jumpFrameMode
         // automaticamente em tempo real com base na degradação do sinal celular (RSRP/SINR).
-        config.signalMonitoring = prefs.getBoolean(SIGNAL_MONITORING_PREF_STRING, false);
+        config.signalMonitoring = prefs.getBoolean(SIGNAL_MONITORING_PREF_STRING, DefaultSignalMonitoringConfig.DEFAULT_SIGNAL_MONITORING);
         config.jumpFrameMode = Integer.parseInt(prefs.getString(JUMP_FRAME_MODE_PREF_STRING, String.valueOf(DEFAULT_JUMP_FRAME_MODE)));
         config.targetLatencyMs = prefs.getInt(TARGET_LATENCY_PREF_STRING, DEFAULT_TARGET_LATENCY_MS);
         config.adaptiveResolution = prefs.getBoolean(ADAPTIVE_RESOLUTION_PREF_STRING, DEFAULT_ADAPTIVE_RESOLUTION);

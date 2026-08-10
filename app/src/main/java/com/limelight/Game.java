@@ -28,6 +28,7 @@ import com.limelight.nvstream.input.ControllerPacket;
 import com.limelight.nvstream.input.KeyboardPacket;
 import com.limelight.nvstream.input.MouseButtonPacket;
 import com.limelight.nvstream.jni.MoonBridge;
+import com.limelight.mods.CellularBitrateCeilingConfig;
 import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.ui.GameGestures;
@@ -501,7 +502,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             // Use the same ceiling defined in StreamConfiguration so both paths agree.
             // The previous hardcoded 6000 was lower than maxBitrateFor4G (8000) and
             // unnecessarily throttled quality on decent 4G/5G links.
-            int bitrateCeilingKbps = 8000;
+            int bitrateCeilingKbps = CellularBitrateCeilingConfig.CELLULAR_BITRATE_CEILING_KBPS;
             if (streamBitrate > bitrateCeilingKbps) {
                 streamBitrate = bitrateCeilingKbps;
                 LimeLog.info("Slow network profile: capping bitrate to " + bitrateCeilingKbps + " kbps");
