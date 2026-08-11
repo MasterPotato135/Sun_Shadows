@@ -128,6 +128,9 @@ import com.limelight.nvstream.av.video.VideoDecoderRenderer;
 import com.limelight.nvstream.jni.MoonBridge;
 import com.limelight.nvstream.StreamConfiguration;
 import com.limelight.preferences.PreferenceConfiguration;
+import com.limelight.mods.BitrateOptimizer;
+import com.limelight.mods.FrameSimilarityAnalyzer;
+import com.limelight.mods.SignalMonitor;
 
 import android.annotation.TargetApi;
 import android.app.Activity;
@@ -146,9 +149,7 @@ import android.os.SystemClock;
 import android.util.Range;
 import android.view.Choreographer;
 import android.view.SurfaceHolder;
-import android.telephony.TelephonyManager;
-import android.telephony.PhoneStateListener;
-import android.telephony.SignalStrength;
+// TelephonyManager, PhoneStateListener, SignalStrength movidos para SignalMonitor (/mods/)
 
 public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
 
@@ -159,14 +160,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int JUMPFRAME_COUNTER_INTERVAL = 5;
     private int jumpFrameCounter = 0;
     private int jumpFrameMode = StreamConfiguration.JUMPFRAME_MODE_OFF;
-    private static final int FRAME_SAMPLE_SIZE = 128;
+    // FRAME_SAMPLE_SIZE centralizado no mod — não declare aqui como constante inline.
+    private static final int FRAME_SAMPLE_SIZE = com.limelight.mods.FrameSampleSizeConfig.FRAME_SAMPLE_SIZE;
     // Grade 2D para o Block Analysis: 16 colunas × 8 linhas = 128 "pixels" pseudo-frame.
     // Escolhido para que PSEUDO_FRAME_COLS * PSEUDO_FRAME_ROWS == FRAME_SAMPLE_SIZE
     // e a proporção 2:1 aproxime uma tela widescreen (16:9 → 2:1 em escala reduzida).
     private static final int PSEUDO_FRAME_COLS = 16;
     private static final int PSEUDO_FRAME_ROWS = 8;
-    private byte[] lastFrameSample;
+    // lastFrameSample e lastBitrateAnalysisMs gerenciados por FrameSimilarityAnalyzer e BitrateOptimizer.
     private long lastBitrateAnalysisMs;
+
+    // ── Módulos /mods/ centralizados ─────────────────────────────────────────
+    private BitrateOptimizer bitrateOptimizer;
+    private FrameSimilarityAnalyzer frameSimilarityAnalyzer;
+    private SignalMonitor signalMonitor;
     // Timers independentes por análise — evita que bitrateAnalysisIntervalMs
     // controle indiretamente a frequência de Block e Area Dedup.
     private long lastBlockAnalysisMs;
@@ -200,19 +207,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private static final int SHARPNESS_QP_MIN = 10; // QP mínimo (máxima nitidez)
     private static final int SHARPNESS_QP_MAX = 40; // QP máximo (suavização)
 
-    // Bitrate dinâmico baseado em similaridade de frames.
-    // Redução: após BITRATE_REDUCE_THRESHOLD frames similares, reduz 30% imediatamente.
-    // Restauração: NÃO é instantânea — sobe em degraus de BITRATE_RAMPUP_STEP_PERCENT
-    // a cada BITRATE_RESTORE_THRESHOLD frames distintos consecutivos, até atingir o
-    // bitrate original. Isso evita o spike de rede imediato quando a cena muda subitamente.
-    private int consecutiveSimilarFrames = 0;
-    private int consecutiveDissimilarFrames = 0;
-    private volatile int currentDynamicBitrate = 0; // 0 = não inicializado; usa prefs.bitrate como base
-    private volatile boolean bitrateReduced = false;
-    private static final int BITRATE_REDUCE_THRESHOLD = 10;  // frames similares para reduzir
-    private static final int BITRATE_RESTORE_THRESHOLD = 5;  // frames distintos por degrau de subida
-    private static final int BITRATE_REDUCE_PERCENT = 30;    // redução inicial (30% do atual)
-    private static final int BITRATE_RAMPUP_STEP_PERCENT = 15; // cada degrau de subida sobe 15% do alvo
+    // Bitrate dinâmico: estado (consecutiveSimilarFrames, consecutiveDissimilarFrames,
+    // currentDynamicBitrate, bitrateReduced, constantes) foi movido para BitrateOptimizer.
 
     // Used on versions < 5.0
     private ByteBuffer[] legacyInputBuffers;
@@ -331,19 +327,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private HandlerThread choreographerHandlerThread;
     private Handler choreographerHandler;
 
-    // Thread dedicada para despachar requestBitrateChange() fora da thread de callback JNI,
-    // evitando deadlock/reentrância no moonlight-common-c quando chamado de submitDecodeUnit.
-    private HandlerThread bitrateHandlerThread;
-    private Handler bitrateHandler;
-
-    // Monitoramento de sinal 4G: escala jumpFrameMode automaticamente quando ativo.
-    // O listener lê RSRP (potência do sinal LTE) e SINR (qualidade) da SignalStrength
-    // e mapeia para OFF/LIGHT/MEDIUM/HEAVY. Nunca escreve em currentDynamicBitrate
-    // nem chama nada do MoonBridge — só chama setJumpFrameMode() que é thread-safe.
-    private TelephonyManager telephonyManager;
-    private PhoneStateListener signalListener;
-    // jumpFrameMode base configurado pelo usuário (antes do monitoramento escalar).
-    // Guardamos para restaurar quando desativar o monitor ou se o sinal melhorar.
+    // HandlerThread, Handler, TelephonyManager e PhoneStateListener foram movidos para
+    // BitrateOptimizer e SignalMonitor respectivamente. Os campos abaixo são apenas
+    // a referência ao modo base (necessária em setup() antes de criar o SignalMonitor).
     private int baseJumpFrameMode = StreamConfiguration.JUMPFRAME_MODE_OFF;
 
     private int numSpsIn;
@@ -530,151 +516,42 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
      * Garante: nunca sobe acima de HEAVY, nunca divide por zero, nunca deixa
      * pendingJumpFrameDrops > cap de 3 (já garantido pelo getAndUpdate existente).
      */
-    private void startSignalMonitoring() {
-        try {
-            telephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
-            if (telephonyManager == null) {
-                LimeLog.warning("SignalMonitor: TelephonyManager not available");
-                return;
-            }
-
-            signalListener = new PhoneStateListener() {
-                @Override
-                public void onSignalStrengthsChanged(SignalStrength signalStrength) {
-                    if (signalStrength == null) return;
-
-                    // Lê RSRP (potência) e SINR (qualidade) LTE via reflexão.
-                    // getLteRsrp()/getLteRssnr() existem desde API 17 (ocultos) e são públicos
-                    // a partir do API 29, mas o compilador Java rejeita chamadas diretas quando
-                    // compileSdk < 29 — mesmo dentro de um guard SDK_INT. Reflexão resolve isso
-                    // sem @RequiresApi e sem precisar elevar o compileSdk.
-                    int rsrp = Integer.MIN_VALUE;
-                    int sinr = Integer.MAX_VALUE;
-                    try {
-                        java.lang.reflect.Method mRsrp = signalStrength.getClass().getMethod("getLteRsrp");
-                        java.lang.reflect.Method mSinr = signalStrength.getClass().getMethod("getLteRssnr");
-                        Object rsrpObj = mRsrp.invoke(signalStrength);
-                        Object sinrObj = mSinr.invoke(signalStrength);
-                        if (rsrpObj instanceof Integer) rsrp = (Integer) rsrpObj;
-                        if (sinrObj instanceof Integer) sinr = (Integer) sinrObj;
-                    } catch (Exception e) {
-                        // Dispositivo não reporta LTE ou API não disponível; usará getLevel() abaixo
-                    }
-
-                    // Fallback: usa nível geral (0-4) se RSRP não disponível
-                    boolean rsrpValid = rsrp != Integer.MIN_VALUE && rsrp < -30;
-                    boolean sinrValid = sinr != Integer.MAX_VALUE;
-
-                    int newMode;
-                    if (rsrpValid) {
-                        // Mapeamento RSRP → jumpFrameMode
-                        // Não usa divisão — só comparações, sem risco de /0
-                        if (rsrp >= -95) {
-                            // Sinal excelente/bom: restaura configuração do usuário
-                            newMode = baseJumpFrameMode;
-                        } else if (rsrp >= -105) {
-                            // Sinal médio: garante pelo menos LIGHT
-                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_LIGHT);
-                        } else if (rsrp >= -115) {
-                            // Sinal ruim: escala para MEDIUM
-                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_MEDIUM);
-                        } else {
-                            // Sinal crítico (< -115 dBm): HEAVY
-                            newMode = StreamConfiguration.JUMPFRAME_MODE_HEAVY;
-                        }
-                        // Refinamento: se SINR também disponível e muito baixo, sobe um nível
-                        if (sinrValid && sinr < 30 && newMode < StreamConfiguration.JUMPFRAME_MODE_HEAVY) {
-                            // sinr < 30 significa SINR < 3 dB (muito ruidoso)
-                            newMode = Math.min(newMode + 1, StreamConfiguration.JUMPFRAME_MODE_HEAVY);
-                        }
-                    } else {
-                        // RSRP não disponível: usa nível geral do sinal (0=sem sinal, 4=excelente)
-                        int level = signalStrength.getLevel(); // 0-4
-                        // Garante que level está no intervalo válido (sem divisão)
-                        if (level < 0) level = 0;
-                        if (level > 4) level = 4;
-                        if (level >= 3) {
-                            newMode = baseJumpFrameMode;
-                        } else if (level == 2) {
-                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_LIGHT);
-                        } else if (level == 1) {
-                            newMode = Math.max(baseJumpFrameMode, StreamConfiguration.JUMPFRAME_MODE_MEDIUM);
-                        } else {
-                            // level == 0: sem sinal
-                            newMode = StreamConfiguration.JUMPFRAME_MODE_HEAVY;
-                        }
-                    }
-
-                    // Só chama setJumpFrameMode se o modo realmente mudou (evita log spam)
-                    if (newMode != jumpFrameMode) {
-                        LimeLog.info("SignalMonitor: RSRP=" + (rsrpValid ? rsrp + " dBm" : "n/a")
-                                + " SINR=" + (sinrValid ? (sinr / 10.0) + " dB" : "n/a")
-                                + " → jumpFrameMode " + jumpFrameMode + " → " + newMode);
-                        setJumpFrameMode(newMode);
-                    }
-                }
-            };
-
-            telephonyManager.listen(signalListener, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS);
-            LimeLog.info("SignalMonitor: started (baseJumpFrameMode=" + baseJumpFrameMode + ")");
-        } catch (SecurityException e) {
-            // Permissão READ_PHONE_STATE não concedida; monitormento não ativa, jumpFrameMode fica intacto
-            LimeLog.warning("SignalMonitor: permission denied, monitoring disabled");
-            signalListener = null;
-            telephonyManager = null;
-        }
-    }
-
-    /**
-     * Para o monitoramento de sinal e restaura o jumpFrameMode base do usuário.
-     */
-    private void stopSignalMonitoring() {
-        if (telephonyManager != null && signalListener != null) {
-            try {
-                telephonyManager.listen(signalListener, PhoneStateListener.LISTEN_NONE);
-            } catch (Exception e) {
-                // ignora
-            }
-            signalListener = null;
-            telephonyManager = null;
-            // Restaura o modo original configurado pelo usuário
-            setJumpFrameMode(baseJumpFrameMode);
-            LimeLog.info("SignalMonitor: stopped, jumpFrameMode restored to " + baseJumpFrameMode);
-        }
-    }
-    
-    // NEW: Configure jump-frame mode for 4G/Tailscale P2P optimization
+    // Configure jump-frame mode for 4G/Tailscale P2P optimization
     public void setJumpFrameMode(int mode) {
         this.jumpFrameMode = mode;
         if (mode != StreamConfiguration.JUMPFRAME_MODE_OFF) {
             LimeLog.info("Jump-frame mode enabled: " + mode + " (0=off, 1=light 20%, 2=medium 40%, 3=heavy 60%)");
         }
     }
-    
-    // Solicita ao host encoder (Sunshine/NVENC) que ajuste o bitrate via control stream.
-    // Esta é a única rota que realmente reduz bytes transmitidos pela rede.
-    // IMPORTANTE: esta chamada é despachada via bitrateHandler para garantir que
-    // MoonBridge.requestBitrateChange() nunca seja invocado dentro da thread de
-    // callback JNI (submitDecodeUnit), o que causaria deadlock/reentrância no
-    // moonlight-common-c e derrubava o processo com UnsatisfiedLinkError.
+
+    /**
+     * @deprecated Substituído por {@link BitrateOptimizer#onFrame} que despacha internamente.
+     *             Mantido para compatibilidade de chamadas externas (ex: testes, binders).
+     */
     public void updateDynamicBitrate(final int newBitrate) {
+        // Delega ao BitrateOptimizer que já possui o Handler interno.
+        // BitrateOptimizer.dispatchBitrateChange é privado; chamamos reset() como
+        // substituto para chamadas externas que forçam um bitrate específico.
+        // Para o caso de recovery (restaurar prefs.bitrate), bitrateOptimizer.reset()
+        // já é chamado diretamente em doCodecRecoveryIfRequired().
         if (newBitrate <= 0) {
-            LimeLog.warning("Dynamic bitrate update ignored: invalid value " + newBitrate);
+            LimeLog.warning("updateDynamicBitrate: valor inválido ignorado: " + newBitrate);
             return;
         }
-        if (bitrateHandler == null) {
-            LimeLog.warning("Dynamic bitrate update ignored: bitrateHandler not ready");
+        // Dispatch direto via BitrateOptimizer handler para manter thread-safety.
+        android.os.Handler h = (bitrateOptimizer != null) ? bitrateOptimizer.getHandler() : null;
+        if (h == null) {
+            LimeLog.warning("updateDynamicBitrate: BitrateOptimizer não iniciado, chamada ignorada");
             return;
         }
-        bitrateHandler.post(new Runnable() {
+        h.post(new Runnable() {
             @Override
             public void run() {
                 try {
                     MoonBridge.requestBitrateChange(newBitrate);
-                    LimeLog.info("Dynamic bitrate updated to " + newBitrate + " kbps");
+                    LimeLog.info("updateDynamicBitrate: bitrate → " + newBitrate + " kbps");
                 } catch (UnsatisfiedLinkError e) {
-                    // Biblioteca nativa não implementa requestBitrateChange; ignorar silenciosamente.
-                    LimeLog.warning("requestBitrateChange not available in native lib: " + e.getMessage());
+                    LimeLog.warning("updateDynamicBitrate: requestBitrateChange indisponível: " + e.getMessage());
                 }
             }
         });
@@ -689,6 +566,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.context = activity;
         this.activity = activity;
         this.prefs = prefs;
+
+        // Módulos /mods/ — inicializados aqui para que estejam prontos antes de qualquer
+        // chamada a setup() ou getCapabilities(). O BitrateOptimizer e o SignalMonitor
+        // são started/stopped em setup()/cleanup() respectivamente.
+        this.bitrateOptimizer = new BitrateOptimizer();
+        this.frameSimilarityAnalyzer = new FrameSimilarityAnalyzer();
+        // signalMonitor criado em setup() porque precisa de baseJumpFrameMode e prefs.
         this.crashListener = crashListener;
         this.consecutiveCrashCount = consecutiveCrashCount;
         // Bug corrigido: transitionStrength > 0 e transitionInterpolationType != NONE também
@@ -928,138 +812,29 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
-    private byte[] sampleFrameBytes(byte[] data, int length) {
-        byte[] sample = new byte[FRAME_SAMPLE_SIZE];
-        if (length <= 0) {
-            return sample;
-        }
-
-        for (int i = 0; i < sample.length; i++) {
-            int offset = (int)(((long)i * (length - 1)) / Math.max(1, sample.length - 1));
-            sample[i] = data[offset];
-        }
-
-        return sample;
-    }
-
-    // Número de blocos para análise estrutural da similaridade.
-    // A amostra é dividida em SIMILARITY_BLOCKS segmentos; cada um contribui com
-    // três métricas independentes (média, variância, gradiente), tornando a detecção
-    // mais robusta a variações de quantização entre frames visualmente idênticos.
-    private static final int SIMILARITY_BLOCKS = 8;
-    private static final int SIMILARITY_HEADER_BYTES = 8;
-
-    /**
-     * Similaridade estrutural entre duas amostras de bitstream comprimido.
-     *
-     * Divide o payload em SIMILARITY_BLOCKS blocos e extrai três métricas por bloco:
-     *   1. Média     — captura mudanças globais de energia no bloco (peso 50%).
-     *   2. Variância — captura mudanças de complexidade/textura (peso 25%).
-     *   3. Gradiente — captura mudanças de borda e movimento entre bytes adjacentes (peso 25%).
-     *
-     * O cabeçalho NAL (primeiros SIMILARITY_HEADER_BYTES) contribui com 20% do score
-     * final via comparação exata — diferenças ali indicam mudança de tipo de frame,
-     * não de conteúdo visual.
-     *
-     * Resultado: 0 (completamente diferente) a 100 (idêntico).
-     */
-    private int getEncodedFrameSimilarity(byte[] a, byte[] b) {
-        if (a == null || b == null || a.length != b.length || a.length == 0) {
-            return 0;
-        }
-
-        // Cabeçalho NAL: comparação exata
-        int headerEnd = Math.min(SIMILARITY_HEADER_BYTES, a.length);
-        int headerHits = 0;
-        for (int i = 0; i < headerEnd; i++) {
-            if (a[i] == b[i]) headerHits++;
-        }
-        int hdrScore100 = (headerEnd > 0) ? (headerHits * 100 / headerEnd) : 100;
-
-        // Payload: análise estrutural por blocos
-        int payloadStart = headerEnd;
-        int payloadLen = a.length - payloadStart;
-        if (payloadLen <= 0) {
-            return hdrScore100;
-        }
-
-        int blockLen = Math.max(1, payloadLen / SIMILARITY_BLOCKS);
-        long totalBlockScore = 0;
-        int blocksUsed = 0;
-
-        for (int bi = 0; bi < SIMILARITY_BLOCKS; bi++) {
-            int start = payloadStart + bi * blockLen;
-            int end = (bi == SIMILARITY_BLOCKS - 1) ? a.length : Math.min(start + blockLen, a.length);
-            if (end <= start) continue;
-            int len = end - start;
-
-            // 1) Média
-            long sumA = 0, sumB = 0;
-            for (int i = start; i < end; i++) {
-                sumA += (a[i] & 0xFF);
-                sumB += (b[i] & 0xFF);
-            }
-            float meanA = sumA / (float) len;
-            float meanB = sumB / (float) len;
-            int meanSim = Math.max(0, 100 - (int)(Math.abs(meanA - meanB) * 100f / 255f));
-
-            // 2) Desvio padrão (proxy de variância)
-            float varA = 0, varB = 0;
-            for (int i = start; i < end; i++) {
-                float da = (a[i] & 0xFF) - meanA;
-                float db = (b[i] & 0xFF) - meanB;
-                varA += da * da;
-                varB += db * db;
-            }
-            float stdDiff = Math.abs((float)Math.sqrt(varA / len) - (float)Math.sqrt(varB / len));
-            int varSim = Math.max(0, 100 - (int)(stdDiff * 100f / 127.5f));
-
-            // 3) Gradiente médio entre bytes adjacentes
-            long gradA = 0, gradB = 0;
-            for (int i = start; i < end - 1; i++) {
-                gradA += Math.abs((a[i] & 0xFF) - (a[i + 1] & 0xFF));
-                gradB += Math.abs((b[i] & 0xFF) - (b[i + 1] & 0xFF));
-            }
-            float gDiff = (len > 1)
-                    ? Math.abs(gradA / (float)(len - 1) - gradB / (float)(len - 1))
-                    : 0f;
-            int gradSim = Math.max(0, 100 - (int)(gDiff * 100f / 255f));
-
-            // Combina: média 50%, variância 25%, gradiente 25%
-            totalBlockScore += meanSim * 2 + varSim + gradSim; // max 400 por bloco
-            blocksUsed++;
-        }
-
-        if (blocksUsed == 0) return hdrScore100;
-
-        int payloadScore = (int)(totalBlockScore * 100L / ((long) blocksUsed * 400));
-        // Header: 20%, Payload: 80%
-        return (hdrScore100 * 20 + payloadScore * 80) / 100;
-    }
+    // sampleFrameBytes() e getEncodedFrameSimilarity() foram movidos para FrameSimilarityAnalyzer.
+    // Use frameSimilarityAnalyzer.sampleAndCompare(data, length) para amostrar e comparar,
+    // e frameSimilarityAnalyzer.getLastSample() para obter a última amostra (ex: para BlockAnalysis).
 
     private void analyzeFrameForLocalOptimizations(byte[] data, int length, int frameType) {
-        boolean needsBitrateAnalysis = prefs.bitrateOptimization || prefs.localFrameDeduplication
+        boolean needsAnalysis = prefs.bitrateOptimization || prefs.localFrameDeduplication
                 || prefs.blockCompressionEnabled
                 || prefs.areaDeduplicationEnabled;
-        if (!needsBitrateAnalysis) {
+        if (!needsAnalysis) {
             return;
         }
 
         long nowMs = SystemClock.uptimeMillis();
 
         // Guard: intervalo inválido (0 ou negativo) causaria análise em todo frame,
-        // enfileirando posts no bitrateHandler 60x/s e levando a OOM.
+        // enfileirando posts no BitrateOptimizer 60×/s e levando a OOM.
         long safeBitrateIntervalMs = prefs.bitrateAnalysisIntervalMs > 0
                 ? prefs.bitrateAnalysisIntervalMs : 50;
 
-        // Block: sem pref própria ainda — usa intervalo do bitrate como fallback explícito,
-        // não por acoplamento conceitual, mas por ausência de configuração independente na UI.
-        // Quando uma pref blockAnalysisIntervalMs for exposta, substituir aqui.
+        // Block: sem pref própria ainda — usa intervalo do bitrate como fallback explícito.
         long safeBlockIntervalMs = safeBitrateIntervalMs;
 
-        // Area: areaDedupCheckInterval já existe mas conta em frames, não em ms.
-        // Convertemos para ms com base no fps alvo para ter granularidade independente
-        // do bitrate. Quando uma pref em ms for exposta na UI, substituir aqui.
+        // Area: areaDedupCheckInterval conta em frames; convertemos para ms.
         int targetFps = prefs.fps > 0 ? prefs.fps : 60;
         long frameMs = 1000L / targetFps;
         long safeAreaIntervalMs = Math.max(frameMs, (long) prefs.areaDedupCheckInterval * frameMs);
@@ -1072,80 +847,46 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return;
         }
 
-        byte[] currentSample = sampleFrameBytes(data, length);
+        // ── Amostragem e similaridade via FrameSimilarityAnalyzer ──────────
+        // sampleAndCompare() atualiza internamente a última amostra;
+        // getLastSample() devolve esse mesmo buffer para Block e Area sem duplicar o cálculo.
         int similarity = 0;
         if (runBitrate) {
             lastBitrateAnalysisMs = nowMs;
-            similarity = getEncodedFrameSimilarity(lastFrameSample, currentSample);
-            lastFrameSample = currentSample;
+            similarity = frameSimilarityAnalyzer.sampleAndCompare(data, length);
             activeWindowVideoStats.framesAnalyzedForBitrate++;
+        } else if (runBlock || runArea) {
+            // Precisamos da amostra mas não do número de similaridade — chama sampleAndCompare
+            // para garantir que getLastSample() esteja atualizado para este frame.
+            frameSimilarityAnalyzer.sampleAndCompare(data, length);
         }
 
-        if (runBitrate && similarity >= prefs.frameSimilarityThreshold && frameType != MoonBridge.FRAME_TYPE_IDR) {
+        byte[] currentSample = frameSimilarityAnalyzer.getLastSample();
+
+        // ── Local Frame Deduplication (drop na saída do decoder) ────────────
+        if (runBitrate && similarity >= prefs.frameSimilarityThreshold
+                && frameType != MoonBridge.FRAME_TYPE_IDR) {
             activeWindowVideoStats.similarFramesDetected++;
             if (prefs.localFrameDeduplication) {
                 // FIX-1: AtomicInteger separado para dedup, com cap em 2
                 pendingFrameDedupDrops.getAndUpdate(v -> Math.min(v + 1, 2));
             }
-            consecutiveSimilarFrames++;
-            consecutiveDissimilarFrames = 0;
-        } else if (runBitrate) {
-            consecutiveDissimilarFrames++;
-            consecutiveSimilarFrames = 0;
         }
 
-        if (runBitrate && prefs.bitrateOptimization) {
-            // Guard: bitrate alvo inválido — não há base para calcular reduções/rampups.
-            // Ocorre quando BITRATE_PREF_STRING e BITRATE_PREF_OLD_STRING ausentes nas prefs
-            // (primeiro boot ou prefs corrompidas), resultando em prefs.bitrate == 0.
-            // Sem este guard, currentDynamicBitrate fica preso em 0 para sempre e
-            // o bitrateHandler acumula posts infinitamente até OOM.
-            if (prefs.bitrate <= 0) {
-                LimeLog.warning("Bitrate optimization skipped: prefs.bitrate is " + prefs.bitrate);
-                return;
-            }
-            // BUG-FIX-2: sempre parte do bitrate alvo original para a reducao,
-            // nunca do currentDynamicBitrate corrente -- evita reducao composta
-            // (ex: 10000 -> 7000 -> 4900 -> ...) que travava o encoder num bitrate minimo.
-            if (currentDynamicBitrate <= 0) {
-                currentDynamicBitrate = prefs.bitrate;
-            }
-            if (!bitrateReduced && consecutiveSimilarFrames >= BITRATE_REDUCE_THRESHOLD) {
-                // Cena estavel: reduz sobre o bitrate ALVO original, nao o atual.
-                int reducedBitrate = prefs.bitrate * (100 - BITRATE_REDUCE_PERCENT) / 100;
-                reducedBitrate = Math.max(reducedBitrate, prefs.bitrate / 4); // floor em 25%
-                updateDynamicBitrate(reducedBitrate);
-                currentDynamicBitrate = reducedBitrate;
-                bitrateReduced = true;
-                consecutiveSimilarFrames = 0; // reseta para nao reduzir novamente imediatamente
-                LimeLog.info("Bitrate reduced to " + reducedBitrate + " kbps (stable scene)");
-            } else if (bitrateReduced && consecutiveDissimilarFrames >= BITRATE_RESTORE_THRESHOLD) {
-                // Cena mudou: sobe em degraus em direcao ao alvo.
-                // BUG-FIX-1: NAO zera consecutiveDissimilarFrames entre degraus --
-                // o contador acumula normalmente, cada multiplo de BITRATE_RESTORE_THRESHOLD
-                // avanca um degrau. Zera-lo travava o ramp-up porque o encoder ficava preso
-                // num bitrate baixo enquanto recebia frames dinamicos (causava starvation).
-                int target = prefs.bitrate;
-                int step = Math.max(1, target * BITRATE_RAMPUP_STEP_PERCENT / 100);
-                int nextBitrate = Math.min(target, currentDynamicBitrate + step);
-                updateDynamicBitrate(nextBitrate);
-                currentDynamicBitrate = nextBitrate;
-                if (currentDynamicBitrate >= target) {
-                    bitrateReduced = false;
-                    consecutiveDissimilarFrames = 0;
-                    consecutiveSimilarFrames = 0;
-                    LimeLog.info("Bitrate fully restored to " + target + " kbps");
-                } else {
-                    LimeLog.info("Bitrate ramp-up: " + currentDynamicBitrate + " kbps / " + target + " kbps");
-                }
-            }
+        // ── Bitrate dinâmico via BitrateOptimizer ───────────────────────────
+        if (runBitrate) {
+            boolean isIdr = (frameType == MoonBridge.FRAME_TYPE_IDR);
+            bitrateOptimizer.onFrame(similarity, prefs.bitrate,
+                    prefs.frameSimilarityThreshold, isIdr, prefs.bitrateOptimization);
         }
 
+        // ── Block Analysis ───────────────────────────────────────────────────
         if (runBlock) {
             lastBlockAnalysisMs = nowMs;
             analyzeBlockCompression(currentSample);
         }
 
+        // ── Area Deduplication ───────────────────────────────────────────────
         if (runArea) {
             lastAreaAnalysisMs = nowMs;
             analyzeAreaDeduplication(currentSample);
@@ -1676,26 +1417,25 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // Guard contra redrawRate=0 (não deve acontecer, mas evita divisão por zero).
         this.frameIntervalUs = redrawRate > 0 ? (1_000_000L / redrawRate) : 16_667L;
 
-        // Inicia thread dedicada para chamadas de requestBitrateChange(),
+        // Inicia thread dedicada para chamadas de requestBitrateChange() via BitrateOptimizer,
         // garantindo que nunca ocorram dentro da thread de callback JNI (submitDecodeUnit).
-        bitrateHandlerThread = new HandlerThread("Video - Bitrate");
-        bitrateHandlerThread.start();
-        bitrateHandler = new Handler(bitrateHandlerThread.getLooper());
+        bitrateOptimizer.start();
 
         // Monitoramento de sinal 4G: registra listener apenas se a preferência estiver ativa.
         // Desativado por padrão — quando ativo, escala jumpFrameMode com base em RSRP/SINR,
-        // sem tocar no bitrateHandler nem em currentDynamicBitrate.
+        // sem tocar no bitrateOptimizer nem em currentDynamicBitrate.
         baseJumpFrameMode = prefs.jumpFrameMode;
         if (prefs.signalMonitoring) {
-            // PhoneStateListener requer uma thread com Looper.
-            // setup() é chamado a partir de Thread-75 (sem Looper), por isso
-            // despachamos para o bitrateHandler que já possui um Looper próprio.
-            bitrateHandler.post(new Runnable() {
+            // SignalMonitor criado aqui porque precisa de baseJumpFrameMode (definido acima)
+            // e registra o PhoneStateListener no Handler do BitrateOptimizer (Looper próprio),
+            // pois setup() é chamado de uma thread sem Looper.
+            signalMonitor = new SignalMonitor(context, new SignalMonitor.JumpFrameModeCallback() {
                 @Override
-                public void run() {
-                    startSignalMonitoring();
+                public void onJumpFrameModeChanged(int newMode) {
+                    setJumpFrameMode(newMode);
                 }
-            });
+            }, baseJumpFrameMode);
+            signalMonitor.start(bitrateOptimizer.getHandler());
         }
 
         initLocalFrameOptimizationState(width, height);
@@ -1738,7 +1478,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // FIX-2: garante estado limpo ao inicializar (também cobre reinicializações via recovery)
         this.pendingJumpFrameDrops.set(0);
         this.pendingFrameDedupDrops.set(0);
-        this.lastFrameSample = null;
+        // FrameSimilarityAnalyzer: reset da baseline (lastFrameSample → null)
+        this.frameSimilarityAnalyzer.reset();
         this.lastBitrateAnalysisMs = 0;
         this.lastBlockAnalysisMs = 0;
         this.lastAreaAnalysisMs = 0;
@@ -1747,12 +1488,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.accumulatedSharpness = 0f;
         this.sharpnessFrameCount = 0;
 
-        // Reset bitrate dinâmico — ao reiniciar, volta ao bitrate original para não
-        // manter uma redução de bitrate de uma sessão anterior ou após recovery.
-        this.consecutiveSimilarFrames = 0;
-        this.consecutiveDissimilarFrames = 0;
-        this.currentDynamicBitrate = 0;
-        this.bitrateReduced = false;
+        // BitrateOptimizer: reseta contadores e estado de redução, sem despachar mudança
+        // (bitrate original será aplicado apenas se estava reduzido e isso é feito em reset()).
+        // Em initLocalFrameOptimizationState não há recovery ainda, então reset(0) só limpa.
+        this.bitrateOptimizer.reset(0);
 
         // Inicializa/reseta o FramePacingController com o modo derivado das prefs atuais.
         // Feito aqui (e não em setup()) para garantir reinicialização correta após recovery.
@@ -1795,7 +1534,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 // Reseta flag de thread priority: após recovery o codec pode usar uma thread
                 // nativa diferente, então precisamos elevar a prioridade novamente.
                 jniThreadPrioritySet = false;
-                lastFrameSample = null;          // força nova baseline de comparação pós-recovery
+                // FrameSimilarityAnalyzer: força nova baseline de comparação pós-recovery.
+                frameSimilarityAnalyzer.reset();
                 lastBitrateAnalysisMs = 0;       // permite análise imediata no próximo frame
                 lastBlockAnalysisMs = 0;
                 lastAreaAnalysisMs = 0;
@@ -1803,15 +1543,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 // Reset do pacing controller — garante que âncoras e histórico de intervalos
                 // não reflitam o estado pré-falha, evitando timestamps incorretos pós-IDR.
                 if (framePacingController != null) framePacingController.reset();
-                // Restaura bitrate original após recovery — não manter redução de bitrate
-                // de antes da falha do codec, que poderia impedir a recuperação correta.
-                if (bitrateReduced) {
-                    updateDynamicBitrate(prefs.bitrate);
-                    currentDynamicBitrate = prefs.bitrate;
-                    bitrateReduced = false;
-                }
-                consecutiveSimilarFrames = 0;
-                consecutiveDissimilarFrames = 0;
+                // BitrateOptimizer: restaura bitrate original após recovery e reseta contadores.
+                // reset() despacha requestBitrateChange(prefs.bitrate) se estava reduzido.
+                bitrateOptimizer.reset(prefs.bitrate);
 
                 // If we just need a flush, do so now with all threads quiesced.
                 if (codecRecoveryType.get() == CR_RECOVERY_TYPE_FLUSH) {
@@ -2398,35 +2132,28 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
-        // Encerra a thread de bitrate (se iniciada).
-        // O monitoramento de sinal precisa ser parado ANTES de destruir o bitrateHandler,
-        // pois o PhoneStateListener foi registrado no Looper do bitrateHandlerThread e
-        // telephonyManager.listen() deve ser chamado na mesma thread.
-        if (bitrateHandlerThread != null) {
-            // Para o monitoramento de sinal 4G no Looper correto (antes de quitSafely)
-            if (bitrateHandler != null && signalListener != null) {
-                bitrateHandler.post(new Runnable() {
+        // Encerra o monitoramento de sinal 4G ANTES de parar o BitrateOptimizer,
+        // pois o PhoneStateListener foi registrado no Looper do BitrateOptimizer e
+        // telephonyManager.listen(LISTEN_NONE) precisa correr na mesma thread.
+        if (signalMonitor != null) {
+            android.os.Handler h = bitrateOptimizer.getHandler();
+            if (h != null) {
+                // Despacha stop() no Looper correto e espera conclusão antes de quitSafely().
+                final SignalMonitor sm = signalMonitor;
+                h.post(new Runnable() {
                     @Override
                     public void run() {
-                        stopSignalMonitoring();
+                        sm.stop();
                     }
                 });
             } else {
-                stopSignalMonitoring();
+                signalMonitor.stop();
             }
-            bitrateHandlerThread.quitSafely();
-            try {
-                bitrateHandlerThread.join();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-                Thread.currentThread().interrupt();
-            }
-            bitrateHandlerThread = null;
-            bitrateHandler = null;
-        } else {
-            // Para o monitoramento de sinal 4G (se estava ativo, sem bitrateHandler)
-            stopSignalMonitoring();
+            signalMonitor = null;
         }
+
+        // Para a HandlerThread do BitrateOptimizer (quitSafely + join).
+        bitrateOptimizer.stop();
 
         // Wait for the renderer thread to shut down
         try {
